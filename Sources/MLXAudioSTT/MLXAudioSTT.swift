@@ -55,6 +55,8 @@ public enum STT {
             return try await Qwen3ASRModel.fromPretrained(modelRepo, cache: cache)
         case "glmasr", "glm":
             return try await GLMASRModel.fromPretrained(modelRepo, cache: cache)
+        case "audio8_asr_infinite", "audio8":
+            return try await Audio8Model.fromPretrained(modelRepo, cache: cache)
         case "voxtral", "voxtral_realtime":
             return try await VoxtralRealtimeModel.fromPretrained(modelRepo)
         case "cohere_asr", "cohere":
@@ -110,6 +112,9 @@ public enum STT {
         }
         if lower.contains("cohere") {
             return "cohere_asr"
+        }
+        if lower.contains("audio8") {
+            return "audio8_asr_infinite"
         }
         if lower.contains("parakeet") {
             return "parakeet"
