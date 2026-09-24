@@ -119,12 +119,21 @@ public class NemotronDiarizationModel: Module {
     /// any particular stream. Upstream keeps this as an explicit method on
     /// the model precisely so that global-ness is visible at the call site
     /// rather than discovered later — folding it into a state factory would
-    /// hide it. One `NemotronDiarizationModel` instance can therefore only
-    /// serve one streaming configuration at a time: call this before
-    /// `initStreamingState()`, and do not run two concurrent streams that
-    /// want different presets against the same model instance — create a
-    /// second `NemotronDiarizationModel` (sharing weights is not supported
-    /// by this API) instead.
+    /// hide it.
+    ///
+    /// - Warning: this is not only a concurrency hazard. `streamingStep`
+    ///   and `feedProbabilities` re-read `config.modulesConfig` from the
+    ///   model on every single call — nothing snapshots the preset into a
+    ///   `NemotronStreamingState` at `initStreamingState()` time. So a
+    ///   single-threaded caller can corrupt an in-progress, unfinished
+    ///   stream just as easily as two concurrent ones can race: call this
+    ///   once, before any stream on this model starts, and do not call it
+    ///   again while any stream created from this model is still open
+    ///   (i.e. before its `feed(..., final: true)`) — not even from the
+    ///   same thread, one call after another, with no concurrency
+    ///   involved at all. Start a new stream (or a second
+    ///   `NemotronDiarizationModel`; sharing weights across instances is
+    ///   not supported by this API) if you need a different preset.
     public func setStreamingConfig(_ preset: NemotronStreamingPreset) {
         var modules = config.modulesConfig
         modules.chunkLen = preset.chunk
@@ -138,10 +147,13 @@ public class NemotronDiarizationModel: Module {
     /// Fresh, empty streaming state under whatever preset
     /// `setStreamingConfig` last selected (or the checkpoint's own default
     /// `modules_config` if it was never called). Unlike the model-level
-    /// config, this is genuinely per-stream: it mutates nothing on the
-    /// model and a caller can hold as many independent states as it likes
-    /// against one model instance, as long as they all share that one
-    /// active preset.
+    /// config, building this state mutates nothing on the model — but the
+    /// state it returns does not capture the preset; every later
+    /// `feed`/`streamingStep` call on it re-reads `config.modulesConfig`
+    /// live. See `setStreamingConfig`'s warning: a caller can hold several
+    /// states against one model instance only while none of them are
+    /// mutated concurrently with a `setStreamingConfig` call for a
+    /// different preset, and no unfinished stream survives across one.
     public func initStreamingState() -> NemotronStreamingState {
         NemotronStreamingState(config: config, dtype: dtype)
     }

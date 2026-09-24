@@ -63,17 +63,21 @@ independent (Python) implementation of the same checkpoint is the check
 that would have caught it on the first day.
 
 Measured against `mlx-audio-ref` at commit `03a4d99`, running the published
-`mlx-community/Nemotron-3-Diarization` checkpoint (`NemotronParity`, this
-fork's `Sources/Tools/NemotronParity`):
+`mlx-community/Nemotron-3-Diarization` checkpoint. Provenance is called out
+per row below, because that distinction matters: this project's discipline
+is measured, not claimed, and a number this README cannot be re-derived
+from is a claim, not a measurement.
 
-| Stage | Input | Cosine similarity | Threshold | Result |
-|---|---|---|---|---|
-| mel (log-mel frontend) | 4 s noise | `0.9999999990` | ≥ 0.9999 | pass |
-| encoder (31-layer rotary transformer output) | 4 s noise | `0.9999488035` | ≥ 0.999 | pass |
-| probs (single-window speaker probabilities) | 4 s noise | `0.9999749655` | ≥ 0.999 | pass |
-| streaming (chunked `feed`) | 17.4 s real speech | `0.9999997031` | *(reported, not gated)* | measured |
-| streaming (chunked `feed`, **AOSC compression exercised**: `spkcache_compressed: true`) | 53.4 s real speech | `0.9999777511` | *(reported, not gated)* | measured |
-| streaming (chunked `feed`, for comparison — see below) | 4 s noise | `0.9827825139` | *(reported, not gated)* | measured |
+| Stage | Input | Cosine similarity | Threshold | Result | Reproducible how |
+|---|---|---|---|---|---|
+| mel (log-mel frontend) | 4 s noise | `0.9999999990` | ≥ 0.9999 | pass | `NemotronParity`, this repo |
+| encoder (31-layer rotary transformer output) | 4 s noise | `0.9999488035` | ≥ 0.999 | pass | `NemotronParity`, this repo |
+| probs (single-window speaker probabilities) | 4 s noise | `0.9999749655` | ≥ 0.999 | pass | `NemotronParity`, this repo |
+| streaming (chunked `feed`) | 4 s noise | `0.9827825139` | *(reported, not gated)* | measured | `NemotronParity`, this repo |
+| streaming (chunked `feed`) | 5.2 s real speech (`say`) | `0.9999999453` | *(reported, not gated)* | measured | `NemotronParity`, this repo |
+| streaming (chunked `feed`) | 30 s real speech (`Tests/media/multi_speaker.wav`, this repo's own fixture) | `0.9996263850` | *(reported, not gated)* | measured | `NemotronParity`, this repo |
+| streaming (chunked `feed`, **AOSC compression exercised**: `spkcache_compressed: true`) | 58.4 s real speech (`say`, two voices) | `0.9999995964` | *(reported, not gated)* | measured | `NemotronParity`, this repo |
+| streaming (chunked `feed`, **AOSC compression exercised**) | 17.4 s / 53.4 s real speech (unspecified source) | `0.9999997031` / `0.9999777511` | *(reported, not gated)* | measured | external harness, run during review only — not reproducible from this repo |
 
 The encoder and probs stages were run with the *reference's own* mel output
 as input (not this port's mel output), isolating each stage's own
@@ -82,17 +86,63 @@ guidance (`encoder` near zero with `mel` fine would point at the rotary
 convention; a `mel` mismatch would point at the frontend or the
 `fb`/`window` buffers — neither was observed).
 
-The streaming rows are the headline result for the streaming path: on real
-speech, streaming cosine is `0.9999997031` for a 17.4 s clip and
-`0.9999777511` for a 53.4 s clip — both comfortably in the same range as
-the single-window stages. The 53.4 s clip is long enough to overflow the
-FIFO and trigger AOSC compression mid-session (confirmed via
-`state.spkcache_compressed: True`); the compressed cache's frozen
-predictions (the `spkcacheCompressed` freeze in `NemotronStreamingState`,
-implemented per upstream but originally unexercised by this port's own
-short test signal) were exercised and matched the reference. Decoding the
-53.4 s clip's probabilities into segments also reproduced the expected
-two-speaker structure of how that clip was assembled.
+The two `say`-sourced streaming-on-speech rows are the headline result for
+the streaming path, and — unlike the rest of this README's numbers being
+merely described as reproducible — actually are: see "Reproducing the
+streaming-on-speech figures" below to regenerate them from nothing but this
+repo and the `say` command already on any Mac. Both real-speech figures sit
+in the same range as the single-window stages, and the 58.4 s clip is long
+enough to overflow the FIFO and trigger AOSC compression mid-session
+(confirmed via `state.spkcache_compressed: True` on the Python side); the
+compressed cache's frozen predictions (the `spkcacheCompressed` freeze in
+`NemotronStreamingState`, implemented per upstream but originally
+unexercised by this port's own short test signal) were exercised and
+matched the reference exactly.
+
+The bottom row (17.4 s / 53.4 s) is kept because it is real evidence and
+was independently confirmed, not fabricated, but it was measured with an
+external harness during review, not with this repo's own tooling — so it
+cannot be reproduced by running anything checked in here. It corroborates
+the two `say`-sourced rows above it (same order of magnitude, same
+AOSC-compression behavior at the longer duration) but is not itself the
+reproducible claim; treat the `say`-sourced rows as the ones this README
+stands behind.
+
+### Reproducing the streaming-on-speech figures
+
+All four `NemotronParity`-labeled streaming-on-speech rows above were
+produced with this repo's own tooling end-to-end — `nemotron_parity.py`
+(Python reference dump) feeding `NemotronParity` (this fork's Swift
+harness, `Sources/Tools/NemotronParity`) — including the Swift side parsing
+the WAV file itself via a real RIFF chunk walker (`loadWav16kMonoPCM16` in
+`main.swift`), not a fixed 44-byte-header skip: `say -o file.wav` writes a
+`JUNK`/`FLLR` filler chunk ahead of `data`, so PCM audio does not start at
+byte 44 (it starts at byte 4096 for the short clip below) — a naive
+fixed-offset reader would read the filler as audio. `Tests/media/`'s own
+WAVs exercise a different real-world case: a `LIST`/`INFO` metadata chunk
+(this project's files are SoX-processed) ahead of `data`.
+
+```bash
+# Simplest: this repo's own fixture, no audio generation needed.
+PYTHONPATH=<mlx-audio-ref checkout> python3 nemotron_parity.py \
+  <model-dir> <out-dir> Tests/media/multi_speaker.wav
+swift run -c release NemotronParity <model-dir> <out-dir> \
+  Tests/media/multi_speaker.wav <out-dir>/speech_streaming_probs.npy
+
+# Or generate a clip with `say` (also exercises the JUNK/FLLR chunk-walking path):
+say -o speech_test.wav --data-format=LEI16@16000 -v Samantha \
+  "This is a short test of the streaming speaker diarization parity check for the Nemotron model."
+PYTHONPATH=<mlx-audio-ref checkout> python3 nemotron_parity.py \
+  <model-dir> <out-dir> speech_test.wav
+swift run -c release NemotronParity <model-dir> <out-dir> \
+  speech_test.wav <out-dir>/speech_streaming_probs.npy
+```
+
+The 58.4 s two-voice clip that exercises AOSC compression is the same
+process, generated from two longer `say` calls (different voices,
+`-v Samantha` / `-v Daniel`) concatenated at the PCM level with Python's
+`wave` module into one plain-header WAV, then run through the same two
+tool invocations above.
 
 ### Why the 4 s noise streaming figure is lower — and why it is still worth keeping
 
