@@ -24,6 +24,10 @@ class NemotronAttention: Module {
     @ModuleInfo(key: "out_proj") var outProj: Linear
     let rope: RoPE
 
+    // `qk_norm` (a LayerNorm applied to q/k before RoPE when config.qkNorm is
+    // true) is deliberately unimplemented: no shipped Nemotron 3 Diarization
+    // checkpoint sets it (verified qkNorm: false), so this is a known,
+    // intentional gap rather than an oversight.
     init(_ config: NemotronEncoderConfig) {
         self.nHeads = config.nHeads
         self.headDim = config.headDim
@@ -72,7 +76,8 @@ class NemotronFeedForward: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray { fc2(geluApproximate(fc1(x))) }
+    // Exact gelu, matching upstream's `nn.gelu` — not the tanh approximation.
+    func callAsFunction(_ x: MLXArray) -> MLXArray { fc2(gelu(fc1(x))) }
 }
 
 /// Pre-norm: `preBlockNorm` is true for this model, so the norm is applied
@@ -98,44 +103,71 @@ class NemotronTransformerBlock: Module {
     }
 }
 
-/// Stacks `subsamplingFactor` consecutive frames into one, which is how the
-/// 10 ms mel frames become 80 ms encoder frames.
+/// Stacks `subsamplingFactor` consecutive frames into one (10 ms mel frames
+/// into 80 ms encoder frames) and owns the projection into `dModel`, matching
+/// upstream's `FeatureStacking`, which fuses stacking and projection into one
+/// module rather than splitting them across two.
 class NemotronFeatureStacking: Module {
     let factor: Int
+    @ModuleInfo(key: "proj") var proj: Linear
+
     init(_ config: NemotronEncoderConfig) {
         self.factor = config.subsamplingFactor
+        // The checkpoint stores no bias for this projection — bias: false
+        // is not the Linear default and must be explicit, or a bias term
+        // gets trained-from-nothing (initialised to zero, then silently
+        // present as an extra degree of freedom the checkpoint never set).
+        self._proj.wrappedValue = Linear(
+            config.featIn * config.subsamplingFactor, config.dModel, bias: false
+        )
         super.init()
     }
 
     func callAsFunction(_ features: MLXArray, lengths: MLXArray) -> (MLXArray, MLXArray) {
-        let (b, t, d) = (features.dim(0), features.dim(1), features.dim(2))
-        let usable = (t / factor) * factor
-        let trimmed = features[0..., 0..<usable, 0...]
-        return (trimmed.reshaped(b, usable / factor, d * factor), lengths / factor)
+        // Mel arrives as (B, mel, T); transpose to (B, T, mel) before grouping.
+        let x = features.transposed(0, 2, 1)
+        let (b, t, c) = (x.dim(0), x.dim(1), x.dim(2))
+        // Pad UP to a whole number of groups, never truncate down. Dropping
+        // the tail to reach a multiple of `factor` silently shifts every
+        // later frame's group membership by the dropped remainder — that
+        // exact front-trim-vs-end-pad defect offset every group by two
+        // frames in a previous port here and produced fluent nonsense.
+        let padAmount = ((-t % factor) + factor) % factor
+        let padded = MLX.padded(x, widths: [IntOrPair(0), IntOrPair((0, padAmount)), IntOrPair(0)])
+        let grouped = padded.reshaped(b, (t + padAmount) / factor, c * factor)
+        return (proj(grouped), (lengths + factor - 1) / factor)
     }
 }
 
 class NemotronEncoder: Module {
-    @ModuleInfo(key: "pre_encode") var preEncode: Linear
+    @ModuleInfo(key: "pre_encode") var preEncode: NemotronFeatureStacking
+    @ModuleInfo(key: "embed_norm") var embedNorm: UnaryLayer
     @ModuleInfo(key: "layers") var layers: [NemotronTransformerBlock]
-    @ModuleInfo(key: "stacking") var stacking: NemotronFeatureStacking
+    @ModuleInfo(key: "final_norm") var finalNorm: LayerNorm
+
+    let scale: Float
 
     init(_ config: NemotronEncoderConfig) {
-        self._stacking.wrappedValue = NemotronFeatureStacking(config)
-        self._preEncode.wrappedValue = Linear(
-            config.featIn * config.subsamplingFactor, config.dModel
-        )
+        self._preEncode.wrappedValue = NemotronFeatureStacking(config)
+        self._embedNorm.wrappedValue =
+            config.preBlockNorm ? LayerNorm(dimensions: config.dModel) : Identity()
         self._layers.wrappedValue = (0..<config.nLayers).map { _ in
             NemotronTransformerBlock(config)
         }
+        self._finalNorm.wrappedValue = LayerNorm(dimensions: config.dModel)
+        self.scale = config.xscaling ? Float(config.dModel).squareRoot() : 1.0
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray, lengths: MLXArray) -> (MLXArray, MLXArray) {
-        let (stacked, outLengths) = stacking(x, lengths: lengths)
-        var h = preEncode(stacked)
-        let mask = SortformerModules.lengthToMask(outLengths, maxLength: h.dim(1))
+    // Matches upstream's `Model`, which calls `encoder.pre_encode(mel, lengths)`
+    // separately before `encoder(x, lengths)` — this method does NOT call
+    // `preEncode` itself. `x` here is already stacked+projected, and
+    // `lengths` are the post-stacking lengths `preEncode` returned.
+    func callAsFunction(_ x: MLXArray, lengths: MLXArray) -> MLXArray {
+        let valid = MLXArray(0..<x.dim(1)).expandedDimensions(axis: 0) .< lengths.expandedDimensions(axis: 1)
+        let mask = valid.expandedDimensions(axes: [1, 2])
+        var h = embedNorm(x * scale)
         for layer in layers { h = layer(h, mask: mask) }
-        return (h, outLengths)
+        return finalNorm(h)
     }
 }
