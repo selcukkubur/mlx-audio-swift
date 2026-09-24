@@ -24,6 +24,11 @@ import Tokenizers
 public final class Audio8Model: Module, STTGenerationModel {
     public let config: Audio8Config
 
+    /// Emitted when a clock step decodes no new word.
+    static let streamingPadToken = 151_665
+    /// Emitted at a word boundary.
+    static let streamingWordToken = 151_666
+
     @ModuleInfo(key: "encoder") var encoder: VoxtralRealtimeAudioEncoder
     @ModuleInfo(key: "decoder") var decoder: Audio8Decoder
     /// One row per supported clock (4, 6, 8 frames). Added to the delay
@@ -152,6 +157,20 @@ public final class Audio8Model: Module, STTGenerationModel {
             let logits = MLX.matmul(hidden[-1], decoder.embedTokens.weight.transposed(1, 0))
             next = logits.argMax().item(Int.self)
             if next == config.eosTokenId { break }
+
+            // The run-up is not speech and its tokens are not transcript. The
+            // model is fed `leftPadTokens` of silence before the first word so
+            // its encoder has something behind it, and it still emits one token
+            // per step through that silence; kept, they arrive as a few commas
+            // and a stray word before the first real one.
+            guard step >= leftPadTokens + delayTokens else { continue }
+
+            // `[STREAMING_PAD]` and `[STREAMING_WORD]` are the clock's own
+            // punctuation — one is emitted whenever a step decodes no new word,
+            // the other marks a word boundary. They carry no text.
+            if next == Audio8Model.streamingPadToken || next == Audio8Model.streamingWordToken {
+                continue
+            }
             out.append(next)
         }
 

@@ -126,8 +126,14 @@ final class VoxtralRealtimeEncoderAttention: Module {
             theta: ropeTheta
         )
 
-        q = voxtralApplyInterleavedRoPE(q, cos: cos, sin: sin, nHeads: nHeads, headDim: headDim)
-        k = voxtralApplyInterleavedRoPE(k, cos: cos, sin: sin, nHeads: nHeads, headDim: headDim)
+        // **Split-half, not interleaved.** `transformers` applies
+        // `apply_rotary_pos_emb` here, which is `rotate_half`: the first half of
+        // each head's channels pairs with the second half. Interleaved pairing
+        // (0 with 1, 2 with 3) is a different rotation and silently produces a
+        // model that runs and transcribes nonsense — it was measured against the
+        // reference encoder at up to 0.24 absolute on the projected embeddings.
+        q = voxtralApplySplitRoPE(q, cos: cos, sin: sin, nHeads: nHeads, headDim: headDim)
+        k = voxtralApplySplitRoPE(k, cos: cos, sin: sin, nHeads: nHeads, headDim: headDim)
 
         var positionOffset = cache?.positionOffset ?? 0
         if let cache {
