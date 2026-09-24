@@ -41,12 +41,39 @@ public struct NemotronEncoderConfig: Codable, Sendable {
 /// defaults. Reusing it means `SortformerModules.init` takes the value directly
 /// without conversion, and avoids duplicating a subset of an existing type.
 
+/// Mirrors upstream's `MelConfig` (itself `ProcessorConfig` + `feature_size`
+/// override + `pad_to`). Defaults match the published checkpoint exactly:
+/// feature_size 128, sampling_rate 16000, hop_length 160, n_fft 512,
+/// win_length 400, preemphasis 0.97, padding_value 0.0, pad_to 16.
+public struct NemotronProcessorConfig: Codable, Sendable {
+    public var featureSize: Int = 128
+    public var samplingRate: Int = 16_000
+    public var hopLength: Int = 160
+    public var nFFT: Int = 512
+    public var winLength: Int = 400
+    public var preemphasis: Float = 0.97
+    public var paddingValue: Float = 0.0
+    public var padTo: Int = 16
+
+    enum CodingKeys: String, CodingKey {
+        case featureSize = "feature_size"
+        case samplingRate = "sampling_rate"
+        case hopLength = "hop_length"
+        case nFFT = "n_fft"
+        case winLength = "win_length"
+        case preemphasis
+        case paddingValue = "padding_value"
+        case padTo = "pad_to"
+    }
+}
+
 public struct NemotronDiarizationConfig: Codable, Sendable {
     public var modelType: String = "nemotron_diarization"
     public var numSpeakers: Int = 8
     public var outputSubsamplingFactor: Int = 1
     public var encoderConfig = NemotronEncoderConfig()
     public var modulesConfig: ModulesConfig
+    public var processorConfig = NemotronProcessorConfig()
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -54,6 +81,7 @@ public struct NemotronDiarizationConfig: Codable, Sendable {
         case outputSubsamplingFactor = "output_subsampling_factor"
         case encoderConfig = "encoder_config"
         case modulesConfig = "modules_config"
+        case processorConfig = "processor_config"
     }
 }
 
