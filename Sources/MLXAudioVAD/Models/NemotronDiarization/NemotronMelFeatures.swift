@@ -85,12 +85,26 @@ public class NemotronMelFeatures: Module {
             + MLXArray(0..<config.nFFT).expandedDimensions(axis: 0)
             - config.nFFT / 2
 
-        let maxLocalIndex = max(0, audio.dim(0) - 1)
+        let localCount = audio.dim(0)
+        let maxLocalIndex = max(0, localCount - 1)
 
         // Out-of-range positions read as silence via the validity mask, not
         // via the clip: clip alone would read a real (wrong) sample at the
         // buffer's edge instead of the zero upstream returns there.
+        //
+        // `audio` can genuinely be empty here with `count` still positive:
+        // upstream's own streaming contract has a final flush call
+        // (`model.feed([], state, final=True)`) that carries no new samples
+        // but still has pending frames to emit from cache/context alone, so
+        // this is an expected call shape, not a defensive edge case. Every
+        // position is out of range by definition when there is nothing to
+        // gather from, so skip straight to an all-zero result — `clip`
+        // alone does not protect this: clamping to index 0 of a zero-length
+        // axis still faults on `take`, it doesn't produce a safe no-op index.
         func gather(_ indices: MLXArray) -> MLXArray {
+            guard localCount > 0 else {
+                return MLXArray.zeros(indices.shape)
+            }
             let local = indices - sampleOffset
             let clipped = MLX.clip(local, min: 0, max: maxLocalIndex)
             let values = audio.take(clipped)
