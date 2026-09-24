@@ -57,6 +57,10 @@ let package = Package(
             name: "mlx-audio-swift-lid",
             targets: ["mlx-audio-swift-lid"],
         ),
+        .executable(
+            name: "NemotronParity",
+            targets: ["NemotronParity"],
+        ),
 
     ],
     dependencies: [
@@ -164,6 +168,7 @@ let package = Package(
                 "MLXAudioCore",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
             ],
@@ -171,6 +176,7 @@ let package = Package(
             exclude: [
                 "Models/SmartTurn/README.md",
                 "Models/Sortformer/README.md",
+                "Models/NemotronDiarization/README.md",
             ]
         ),
 
@@ -273,6 +279,19 @@ let package = Package(
             exclude: [
                 "README.md",
             ]
+        ),
+        // Parity-gate harness for the Nemotron 3 Diarization port: loads
+        // the checkpoint and compares the Swift port's mel/encoder/probs/
+        // streaming output against a Python reference dump by cosine
+        // similarity. See Sources/MLXAudioVAD/Models/NemotronDiarization/README.md.
+        .executableTarget(
+            name: "NemotronParity",
+            dependencies: [
+                "MLXAudioCore",
+                "MLXAudioVAD",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Sources/Tools/NemotronParity"
         ),
 
         // MARK: - Tests

@@ -49,6 +49,29 @@ public struct NemotronStreamingState: Sendable {
     /// Frames already emitted as finalized, so a span is not reported twice.
     public var emittedUpTo: Int
 
+    /// Total raw PCM samples ever handed to `feed`, on the same global
+    /// sample clock as `frameOffset`/`pcmOffset`. Mirrors upstream's
+    /// `samples_received`; needed (with `frameOffset`) to know how many
+    /// whole mel frames are available before the next window can run.
+    public var samplesReceived: Int
+    /// `pcmTail`'s own position on that global sample clock — the
+    /// `sample_offset` upstream threads through so `NemotronMelFeatures`
+    /// can resolve `pcmTail`'s local indices back to global frame
+    /// positions after older samples have been trimmed off the front.
+    public var pcmOffset: Int
+    /// Once the arrival-order speaker cache has been compressed once,
+    /// its retained predictions are frozen and must be reused verbatim on
+    /// every later fold-in rather than recomputed from the current
+    /// window's encoder pass (whose frame positions no longer line up with
+    /// the compressed, non-contiguous cache). Mirrors upstream's
+    /// `spkcache_compressed`; this is not a performance detail, getting it
+    /// wrong silently reintroduces already-discarded frames' stale scores.
+    public var spkcacheCompressed: Bool
+    /// Set once `feed` has been called with `final: true`. Mirrors
+    /// upstream's `finished`, which raises rather than silently continuing
+    /// a stream after its lookahead has been flushed.
+    public var finished: Bool
+
     /// `dtype` is the encoder's own weight dtype (query it from the loaded
     /// model, e.g. the `pre_encode.proj` weight, as upstream's `self.dtype`
     /// property does) — not hardcoded here, since a caller loading a
@@ -67,5 +90,9 @@ public struct NemotronStreamingState: Sendable {
         self.pcmTail = []
         self.frameOffset = 0
         self.emittedUpTo = 0
+        self.samplesReceived = 0
+        self.pcmOffset = 0
+        self.spkcacheCompressed = false
+        self.finished = false
     }
 }

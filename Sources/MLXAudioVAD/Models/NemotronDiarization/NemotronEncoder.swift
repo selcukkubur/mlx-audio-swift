@@ -107,9 +107,13 @@ class NemotronTransformerBlock: Module {
 /// into 80 ms encoder frames) and owns the projection into `dModel`, matching
 /// upstream's `FeatureStacking`, which fuses stacking and projection into one
 /// module rather than splitting them across two.
-class NemotronFeatureStacking: Module {
+/// `public`: the top-level model (and the parity harness that gates this
+/// port) calls `preEncode` directly, ahead of `NemotronEncoder`, exactly as
+/// upstream's `Model.__call__` calls `encoder.pre_encode(...)` before
+/// `encoder(...)`.
+public class NemotronFeatureStacking: Module {
     let factor: Int
-    @ModuleInfo(key: "proj") var proj: Linear
+    @ModuleInfo(key: "proj") public var proj: Linear
 
     init(_ config: NemotronEncoderConfig) {
         self.factor = config.subsamplingFactor
@@ -123,7 +127,7 @@ class NemotronFeatureStacking: Module {
         super.init()
     }
 
-    func callAsFunction(_ features: MLXArray, lengths: MLXArray) -> (MLXArray, MLXArray) {
+    public func callAsFunction(_ features: MLXArray, lengths: MLXArray) -> (MLXArray, MLXArray) {
         // Mel arrives as (B, mel, T); transpose to (B, T, mel) before grouping.
         let x = features.transposed(0, 2, 1)
         let (b, t, c) = (x.dim(0), x.dim(1), x.dim(2))
@@ -139,8 +143,13 @@ class NemotronFeatureStacking: Module {
     }
 }
 
-class NemotronEncoder: Module {
-    @ModuleInfo(key: "pre_encode") var preEncode: NemotronFeatureStacking
+/// `public`: exposed beyond this file (and beyond this module) so a caller
+/// — including the parity harness this port is gated on — can run
+/// `preEncode` and `callAsFunction` as the two separate steps upstream's own
+/// `Model.__call__` keeps them as, rather than only through the top-level
+/// `NemotronDiarizationModel`.
+public class NemotronEncoder: Module {
+    @ModuleInfo(key: "pre_encode") public var preEncode: NemotronFeatureStacking
     @ModuleInfo(key: "embed_norm") var embedNorm: UnaryLayer
     @ModuleInfo(key: "layers") var layers: [NemotronTransformerBlock]
     @ModuleInfo(key: "final_norm") var finalNorm: LayerNorm
@@ -163,7 +172,7 @@ class NemotronEncoder: Module {
     // separately before `encoder(x, lengths)` — this method does NOT call
     // `preEncode` itself. `x` here is already stacked+projected, and
     // `lengths` are the post-stacking lengths `preEncode` returned.
-    func callAsFunction(_ x: MLXArray, lengths: MLXArray) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray, lengths: MLXArray) -> MLXArray {
         let valid = MLXArray(0..<x.dim(1)).expandedDimensions(axis: 0) .< lengths.expandedDimensions(axis: 1)
         let mask = valid.expandedDimensions(axes: [1, 2])
         var h = embedNorm(x * scale)

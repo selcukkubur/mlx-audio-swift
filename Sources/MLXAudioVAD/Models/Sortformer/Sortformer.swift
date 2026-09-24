@@ -1217,7 +1217,14 @@ public class SortformerModel: Module {
         return (gatheredEmbs, gatheredPreds)
     }
 
-    private static func compressSpkcacheAosc(
+    /// AOSC compression: keep the most informative frames per speaker.
+    ///
+    /// Not `private`: Nemotron 3 Diarization's own streaming step calls this
+    /// directly (matching upstream, where `Model.streaming_step` calls
+    /// `Sortformer.Model._compress_spkcache_aosc` — the exact same static
+    /// method, not a reimplementation), since Nemotron's AOSC bookkeeping is
+    /// otherwise identical to Sortformer's.
+    static func compressSpkcacheAosc(
         embs: MLXArray, preds: MLXArray,
         meanSilEmb: MLXArray, modulesCfg: ModulesConfig
     ) -> (MLXArray, MLXArray) {

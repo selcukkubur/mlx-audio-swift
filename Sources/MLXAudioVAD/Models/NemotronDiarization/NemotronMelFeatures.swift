@@ -92,15 +92,18 @@ public class NemotronMelFeatures: Module {
         // via the clip: clip alone would read a real (wrong) sample at the
         // buffer's edge instead of the zero upstream returns there.
         //
-        // `audio` can genuinely be empty here with `count` still positive:
-        // upstream's own streaming contract has a final flush call
-        // (`model.feed([], state, final=True)`) that carries no new samples
-        // but still has pending frames to emit from cache/context alone, so
-        // this is an expected call shape, not a defensive edge case. Every
-        // position is out of range by definition when there is nothing to
-        // gather from, so skip straight to an all-zero result — `clip`
-        // alone does not protect this: clamping to index 0 of a zero-length
-        // axis still faults on `take`, it doesn't produce a safe no-op index.
+        // `audio` can genuinely be empty here with `count` still positive.
+        // This is defensive hardening, not upstream's documented contract:
+        // tracing upstream's `feed()` shows it never calls `MelFeatures`
+        // with an empty buffer — every call passes `state.audio_buffer`,
+        // which always retains at least the trailing context samples. A
+        // caller here that violates that same contract would otherwise hit
+        // `take` on a zero-length axis, which faults rather than degrading
+        // gracefully: every position is out of range by definition when
+        // there is nothing to gather from, so skip straight to an all-zero
+        // result — `clip` alone does not protect this, since clamping to
+        // index 0 of a zero-length axis still faults on `take`, it doesn't
+        // produce a safe no-op index.
         func gather(_ indices: MLXArray) -> MLXArray {
             guard localCount > 0 else {
                 return MLXArray.zeros(indices.shape)
