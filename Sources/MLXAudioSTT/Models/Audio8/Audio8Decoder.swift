@@ -75,11 +75,22 @@ final class Audio8Attention: Module {
 
         // Grouped-query attention: repeat the key/value heads to meet the
         // query heads. 16 query heads against 2 key/value heads here.
+        // Each key/value head serves `repeats` CONSECUTIVE query heads — kv head
+        // 0 for query heads 0..<8, kv head 1 for 8..<16. Written as an explicit
+        // expand-and-reshape rather than a repeat helper, because the two
+        // plausible repeat semantics (each element repeated, versus the whole
+        // sequence tiled) give different head mappings and only one of them is
+        // grouped-query attention.
         let repeats = nHeads / nKvHeads
         var kk = keys, vv = values
         if repeats > 1 {
-            kk = MLX.repeated(keys, count: repeats, axis: 1)
-            vv = MLX.repeated(values, count: repeats, axis: 1)
+            let t = keys.shape[0]
+            kk = MLX.broadcast(
+                keys.expandedDimensions(axis: 2), to: [t, nKvHeads, repeats, headDim]
+            ).reshaped(t, nHeads, headDim)
+            vv = MLX.broadcast(
+                values.expandedDimensions(axis: 2), to: [t, nKvHeads, repeats, headDim]
+            ).reshaped(t, nHeads, headDim)
         }
 
         let qT = q.transposed(1, 0, 2)
