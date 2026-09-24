@@ -46,8 +46,6 @@ public struct NemotronStreamingState: Sendable {
     /// 10 ms frames, before output downsampling (mirrors upstream's
     /// `frames_processed`).
     public var frameOffset: Int
-    /// Frames already emitted as finalized, so a span is not reported twice.
-    public var emittedUpTo: Int
 
     /// Total raw PCM samples ever handed to `feed`, on the same global
     /// sample clock as `frameOffset`/`pcmOffset`. Mirrors upstream's
@@ -89,7 +87,6 @@ public struct NemotronStreamingState: Sendable {
         self.fifoPreds = MLXArray.zeros([1, 0, numSpeakers])
         self.pcmTail = []
         self.frameOffset = 0
-        self.emittedUpTo = 0
         self.samplesReceived = 0
         self.pcmOffset = 0
         self.spkcacheCompressed = false

@@ -72,7 +72,8 @@ func runGate() throws {
     // --- Stage 4: streaming. Same "low" preset, same chunking scheme (4000
     // samples per feed, deliberately not aligned to the streaming window),
     // same reference audio, as the Python side's streaming dump. ---
-    var state = model.initStreamingState(preset: .low)
+    model.setStreamingConfig(.low)
+    var state = model.initStreamingState()
     let audioSamples: [Float] = referenceAudio.asType(.float32).asArray(Float.self)
     let chunkSamples = 4000
     var streamingOutputs: [MLXArray] = []

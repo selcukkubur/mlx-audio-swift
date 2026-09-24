@@ -63,16 +63,17 @@ independent (Python) implementation of the same checkpoint is the check
 that would have caught it on the first day.
 
 Measured against `mlx-audio-ref` at commit `03a4d99`, running the published
-`mlx-community/Nemotron-3-Diarization` checkpoint on a fixed-seed (`seed=0`)
-~4-second 16 kHz Gaussian noise waveform (`NemotronParity`, this fork's
-`Sources/Tools/NemotronParity`):
+`mlx-community/Nemotron-3-Diarization` checkpoint (`NemotronParity`, this
+fork's `Sources/Tools/NemotronParity`):
 
-| Stage | Cosine similarity | Threshold | Result |
-|---|---|---|---|
-| mel (log-mel frontend) | `0.9999999990` | ≥ 0.9999 | pass |
-| encoder (31-layer rotary transformer output) | `0.9999488035` | ≥ 0.999 | pass |
-| probs (single-window speaker probabilities) | `0.9999749655` | ≥ 0.999 | pass |
-| streaming (chunked `feed`, AOSC/FIFO exercised) | `0.9827825139` | *(reported, not gated — see below)* | measured |
+| Stage | Input | Cosine similarity | Threshold | Result |
+|---|---|---|---|---|
+| mel (log-mel frontend) | 4 s noise | `0.9999999990` | ≥ 0.9999 | pass |
+| encoder (31-layer rotary transformer output) | 4 s noise | `0.9999488035` | ≥ 0.999 | pass |
+| probs (single-window speaker probabilities) | 4 s noise | `0.9999749655` | ≥ 0.999 | pass |
+| streaming (chunked `feed`) | 17.4 s real speech | `0.9999997031` | *(reported, not gated)* | measured |
+| streaming (chunked `feed`, **AOSC compression exercised**: `spkcache_compressed: true`) | 53.4 s real speech | `0.9999777511` | *(reported, not gated)* | measured |
+| streaming (chunked `feed`, for comparison — see below) | 4 s noise | `0.9827825139` | *(reported, not gated)* | measured |
 
 The encoder and probs stages were run with the *reference's own* mel output
 as input (not this port's mel output), isolating each stage's own
@@ -81,17 +82,29 @@ guidance (`encoder` near zero with `mel` fine would point at the rotary
 convention; a `mel` mismatch would point at the frontend or the
 `fb`/`window` buffers — neither was observed).
 
-### Streaming: measured, not gated, and honestly lower
+The streaming rows are the headline result for the streaming path: on real
+speech, streaming cosine is `0.9999997031` for a 17.4 s clip and
+`0.9999777511` for a 53.4 s clip — both comfortably in the same range as
+the single-window stages. The 53.4 s clip is long enough to overflow the
+FIFO and trigger AOSC compression mid-session (confirmed via
+`state.spkcache_compressed: True`); the compressed cache's frozen
+predictions (the `spkcacheCompressed` freeze in `NemotronStreamingState`,
+implemented per upstream but originally unexercised by this port's own
+short test signal) were exercised and matched the reference. Decoding the
+53.4 s clip's probabilities into segments also reproduced the expected
+two-speaker structure of how that clip was assembled.
 
-The brief's own three thresholds (mel/encoder/probs) are all single-window
-figures and all pass comfortably. The streaming figure was added on top of
-those — the brief itself does not require it — specifically because a
-single-window comparison never exercises the speaker cache or FIFO at all,
-and those accumulate error silently rather than announcing it.
+### Why the 4 s noise streaming figure is lower — and why it is still worth keeping
 
-The measured streaming cosine, `0.9827825139`, is real and is noticeably
-lower than the single-window figures. Diagnosis, checked directly rather
-than assumed:
+The `0.9827825139` row above uses the *same* fixed-seed Gaussian noise
+waveform as the mel/encoder/probs rows, run through streaming `feed` instead
+of a single window. It is not the headline streaming number — the real-
+speech rows are — but it is kept because it is the evidence for why a
+near-zero-activation input scores measurably lower here than on real
+speech, which is itself a useful thing to know about this metric.
+
+Diagnosis, checked directly rather than assumed, before the real-speech
+figures above existed to confirm it:
 
 - **Not a boundary/indexing bug.** The per-window central-frame extraction,
   FIFO growth (`chunk[:, :n]`), and `frames_processed` bookkeeping were
@@ -105,9 +118,9 @@ than assumed:
   samples and matched to `0.0` absolute difference (bit-exact) — the
   chunked/global-sample-clock gather in `NemotronMelFeatures` is internally
   self-consistent.
-- **What it is:** the input is synthetic Gaussian noise with no real
-  speech, so every stage — offline or streaming — correctly predicts
-  near-silence throughout (probabilities in the `1e-5`–`1e-14` range).
+- **What it is:** the noise input has no real speech, so every stage —
+  offline or streaming — correctly predicts near-silence throughout
+  (reference probabilities max out around `2.3e-5`, most much smaller).
   Streaming re-runs the *entire* 31-layer encoder from scratch on every
   window (upstream's own design: `self.encoder(combined, lengths)` over the
   concatenated spkcache+FIFO+chunk, not an incremental/cached attention),
@@ -119,14 +132,9 @@ than assumed:
   upstream perturbations, which is exactly what a magnitude-sensitive
   metric like cosine similarity penalizes — even though the qualitative
   behavior (correctly predicting silence throughout) is preserved at every
-  stage.
-
-This is reported as a genuine finding, not smoothed over: streaming parity
-on real speech, where activations are not saturating a sigmoid's flattest
-region, would be a stronger and more representative test than this
-synthetic-noise waveform provides. A follow-up parity run against a real
-speech sample is worth doing before treating the streaming path as fully
-proven, even though nothing examined here points at an implementation bug.
+  stage. On real speech, where activations are not saturating a sigmoid's
+  flattest region, this effect essentially disappears — which is exactly
+  what the 17.4 s and 53.4 s rows above show.
 
 ## Quick Start
 
@@ -142,14 +150,21 @@ let mel = model.preprocessor(audioSamples)          // (1, 128, T)
 let lengths = MLXArray([Int32(mel.dim(2))])
 let probs = model(mel, lengths: lengths)             // (1, ceil(T/8)*8, numSpeakers)
 
-// Streaming:
-var state = model.initStreamingState(preset: .low)
+// Streaming: select a preset once, then start as many streams as you like
+// under it. `setStreamingConfig` mutates the MODEL (matching upstream's
+// `set_streaming_config`, kept as an explicit model-level call for exactly
+// that reason) — one model instance cannot run two streams under two
+// different presets concurrently.
+model.setStreamingConfig(.low)
+var state = model.initStreamingState()
 let segments = model.feed(chunkOfSamples, state: &state, final: false)
 // ... more chunks ...
 let finalSegments = model.feed([], state: &state, final: true)
 ```
 
-`initStreamingState(preset:)` combines what upstream splits across two
-calls (`init_streaming_state()` + `set_streaming_config(preset)`) into one:
-selecting a preset (`.offline`, `.low`, `.veryLow`, `.ultraLow`) and getting
-a fresh, empty state are always wanted together.
+`setStreamingConfig(.offline | .low | .veryLow | .ultraLow)` picks one of
+NVIDIA's latency presets (input-buffer latency, excluding compute and the
+STFT window: offline=30.4s, low=1.04s, very_low=0.64s, ultra_low=0.32s).
+`initStreamingState()` is genuinely per-stream — a fresh, empty state that
+mutates nothing on the model — but it always runs under whichever preset
+`setStreamingConfig` last selected on that model instance.

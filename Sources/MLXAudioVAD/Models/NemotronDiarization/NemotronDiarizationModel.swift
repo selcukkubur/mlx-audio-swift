@@ -113,12 +113,19 @@ public class NemotronDiarizationModel: Module {
 
     // MARK: - Streaming
 
-    /// Fresh streaming state for one of NVIDIA's latency presets. Combines
-    /// what upstream splits across two calls (`init_streaming_state()` +
-    /// `set_streaming_config(preset)`) into one, since a Swift caller always
-    /// wants both together: an empty state under a chunk/right-context/FIFO
-    /// configuration that every later `feed` on this state will honor.
-    public func initStreamingState(preset: NemotronStreamingPreset = .low) -> NemotronStreamingState {
+    /// Selects one of NVIDIA's latency presets, matching upstream's
+    /// `set_streaming_config(preset)` (`nemotron_diarization.py` lines
+    /// 237-260) both in name and in shape: **this mutates the model**, not
+    /// any particular stream. Upstream keeps this as an explicit method on
+    /// the model precisely so that global-ness is visible at the call site
+    /// rather than discovered later — folding it into a state factory would
+    /// hide it. One `NemotronDiarizationModel` instance can therefore only
+    /// serve one streaming configuration at a time: call this before
+    /// `initStreamingState()`, and do not run two concurrent streams that
+    /// want different presets against the same model instance — create a
+    /// second `NemotronDiarizationModel` (sharing weights is not supported
+    /// by this API) instead.
+    public func setStreamingConfig(_ preset: NemotronStreamingPreset) {
         var modules = config.modulesConfig
         modules.chunkLen = preset.chunk
         modules.chunkRightContext = preset.rightContext
@@ -126,7 +133,17 @@ public class NemotronDiarizationModel: Module {
         modules.spkcacheLen = 264
         modules.spkcacheUpdatePeriod = preset.cacheUpdatePeriod
         config.modulesConfig = modules
-        return NemotronStreamingState(config: config, dtype: dtype)
+    }
+
+    /// Fresh, empty streaming state under whatever preset
+    /// `setStreamingConfig` last selected (or the checkpoint's own default
+    /// `modules_config` if it was never called). Unlike the model-level
+    /// config, this is genuinely per-stream: it mutates nothing on the
+    /// model and a caller can hold as many independent states as it likes
+    /// against one model instance, as long as they all share that one
+    /// active preset.
+    public func initStreamingState() -> NemotronStreamingState {
+        NemotronStreamingState(config: config, dtype: dtype)
     }
 
     /// Process one feature window against the current cache/FIFO, mutating
@@ -206,6 +223,12 @@ public class NemotronDiarizationModel: Module {
     /// compare against upstream's `result.speaker_probs` directly. Applies
     /// upstream's `_output` pooling by `outputSubsamplingFactor` (a no-op
     /// for the published checkpoint, which sets it to 1).
+    ///
+    /// - Precondition: `state.finished` must be `false`. Upstream raises a
+    ///   catchable `ValueError` on a finished stream; this is not `throws`,
+    ///   so calling it again after a `final: true` call traps instead
+    ///   (`precondition`, which stays live under `-O`) rather than
+    ///   returning an error a caller could recover from.
     public func feedProbabilities(
         _ samples: [Float], state: inout NemotronStreamingState, final: Bool
     ) -> MLXArray {
@@ -284,6 +307,11 @@ public class NemotronDiarizationModel: Module {
     /// with `final: true` to flush lookahead. Direct port of upstream's
     /// `Model.feed` (lines 366-421); segment extraction (upstream's
     /// `_output`) is applied here on top of `feedProbabilities`.
+    ///
+    /// - Warning: calling this again on a `state` that has already seen
+    ///   `final: true` traps (see `feedProbabilities`), it does not throw —
+    ///   `feed` itself is not `throws`. Start a new stream instead: build a
+    ///   fresh `state` from `initStreamingState()`.
     public func feed(
         _ samples: [Float], state: inout NemotronStreamingState, final: Bool,
         threshold: Float = 0.5, minDuration: Float = 0.0, mergeGap: Float = 0.0
