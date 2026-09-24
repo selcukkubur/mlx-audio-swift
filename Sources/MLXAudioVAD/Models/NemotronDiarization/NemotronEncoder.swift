@@ -66,8 +66,8 @@ class NemotronAttention: Module {
 }
 
 class NemotronFeedForward: Module {
-    @ModuleInfo(key: "fc1") var fc1: Linear
-    @ModuleInfo(key: "fc2") var fc2: Linear
+    @ModuleInfo(key: "linear1") var fc1: Linear
+    @ModuleInfo(key: "linear2") var fc2: Linear
 
     init(_ config: NemotronEncoderConfig) {
         let hidden = Int(Float(config.dModel) * config.ffExpansion)
@@ -86,7 +86,7 @@ class NemotronTransformerBlock: Module {
     @ModuleInfo(key: "norm1") var norm1: LayerNorm
     @ModuleInfo(key: "norm2") var norm2: LayerNorm
     @ModuleInfo(key: "attn") var attn: NemotronAttention
-    @ModuleInfo(key: "ff") var ff: NemotronFeedForward
+    @ModuleInfo(key: "ffn") var ff: NemotronFeedForward
 
     init(_ config: NemotronEncoderConfig) {
         self._norm1.wrappedValue = LayerNorm(dimensions: config.dModel)
