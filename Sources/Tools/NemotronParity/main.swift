@@ -121,24 +121,22 @@ func loadWav16kMonoPCM16(_ url: URL) throws -> [Float] {
             description: "\(url.lastPathComponent) is \(bitsPerSample)-bit; only 16-bit PCM is supported"
         )
     }
-    guard channels == 1 || channels == 2 else {
-        throw WavFormatError(description: "\(url.lastPathComponent) has \(channels) channels; expected 1 or 2")
+    guard channels == 1 else {
+        throw WavFormatError(
+            description: "\(url.lastPathComponent) has \(channels) channels; expected mono"
+        )
     }
 
-    let bytesPerFrame = Int(channels) * 2
+    let bytesPerFrame = 2
     let frameCount = pcm.count / bytesPerFrame
     var samples = [Float](repeating: 0, count: frameCount)
     pcm.withUnsafeBytes { raw in
         for frame in 0..<frameCount {
-            var sum: Int32 = 0
-            for ch in 0..<Int(channels) {
-                let byteOffset = frame * bytesPerFrame + ch * 2
-                let lo = Int16(raw[byteOffset])
-                let hi = Int16(raw[byteOffset + 1])
-                let sample = Int16(bitPattern: UInt16(lo) | (UInt16(hi) << 8))
-                sum += Int32(sample)
-            }
-            samples[frame] = Float(sum) / Float(channels) / 32768.0
+            let byteOffset = frame * bytesPerFrame
+            let lo = Int16(raw[byteOffset])
+            let hi = Int16(raw[byteOffset + 1])
+            let sample = Int16(bitPattern: UInt16(lo) | (UInt16(hi) << 8))
+            samples[frame] = Float(sample) / 32768.0
         }
     }
     return samples
