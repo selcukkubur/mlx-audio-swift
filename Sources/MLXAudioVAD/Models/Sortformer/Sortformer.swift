@@ -489,7 +489,10 @@ private class TransformerEncoder: Module {
 // MARK: - Sortformer Modules
 
 /// Sortformer output modules: projection + feedforward + speaker sigmoid.
-private class SortformerModules: Module {
+/// `public` because Nemotron 3 Diarization's speaker head subclasses this, the
+/// way upstream's `SpeakerModules(SortformerModules)` does. Keeping it private
+/// would mean a second copy of the same head.
+public class SortformerModules: Module {
     let nSpk: Int
 
     @ModuleInfo(key: "encoder_proj") var encoderProj: Linear
@@ -514,7 +517,8 @@ private class SortformerModules: Module {
         return sigmoid(spkPreds)
     }
 
-    static func lengthToMask(_ lengths: MLXArray, maxLength: Int) -> MLXArray {
+    /// Creates a mask from sequence lengths; reused by Nemotron 3 Diarization.
+    public static func lengthToMask(_ lengths: MLXArray, maxLength: Int) -> MLXArray {
         let arange = MLXArray(0..<maxLength)
         return arange.expandedDimensions(axis: 0) .< lengths.expandedDimensions(axis: 1)
     }

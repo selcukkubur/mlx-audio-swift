@@ -109,6 +109,8 @@ public struct ModulesConfig: Codable, Sendable {
     public var weakBoostRate: Float
     public var minPosScoresRate: Float
     public var useAosc: Bool
+    public var useActivityHead: Bool
+    public var useLearnableSilEmb: Bool
 
     enum CodingKeys: String, CodingKey {
         case numSpeakers = "num_speakers"
@@ -130,6 +132,8 @@ public struct ModulesConfig: Codable, Sendable {
         case weakBoostRate = "weak_boost_rate"
         case minPosScoresRate = "min_pos_scores_rate"
         case useAosc = "use_aosc"
+        case useActivityHead = "use_activity_head"
+        case useLearnableSilEmb = "use_learnable_sil_emb"
     }
 
     public init(from decoder: Decoder) throws {
@@ -153,6 +157,8 @@ public struct ModulesConfig: Codable, Sendable {
         weakBoostRate = try c.decodeIfPresent(Float.self, forKey: .weakBoostRate) ?? 0.7
         minPosScoresRate = try c.decodeIfPresent(Float.self, forKey: .minPosScoresRate) ?? 0.5
         useAosc = try c.decodeIfPresent(Bool.self, forKey: .useAosc) ?? false
+        useActivityHead = try c.decodeIfPresent(Bool.self, forKey: .useActivityHead) ?? true
+        useLearnableSilEmb = try c.decodeIfPresent(Bool.self, forKey: .useLearnableSilEmb) ?? true
     }
 }
 
