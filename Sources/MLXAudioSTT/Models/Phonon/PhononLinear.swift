@@ -90,18 +90,6 @@ final class PhononProjection: @unchecked Sendable {
             return matmul(x, dense.T)
         }
     }
-
-    /// Bytes of weight this projection holds. It counts the arrays, not MLX's
-    /// allocator, so it is a floor on resident memory rather than a measurement
-    /// of it; the benchmark prints it beside a real RSS reading.
-    var weightBytes: Int {
-        func size(_ a: MLXArray) -> Int { a.size * a.dtype.size }
-        if let packed {
-            return size(packed.trits) + size(packed.hiBits) + size(packed.nzTile)
-                + size(packed.nzRow) + size(packed.lo) + size(packed.hi)
-        }
-        return dense.map(size) ?? 0
-    }
 }
 
 /// A layer whose weights came from a packed block.
@@ -128,8 +116,6 @@ public final class PhononLinear: Linear, PhononPackedLayer {
     let projection: PhononProjection
 
     var packedProjection: PhononProjection { projection }
-
-    public var execution: PhononExecution { projection.execution }
 
     /// The dimensions of the matrix this layer applies, not of whatever is in
     /// `weight`.
@@ -210,8 +196,6 @@ public final class PhononPointwiseConv1d: Conv1d, PhononPackedLayer {
     /// else converted, and at bfloat16 that mixed-dtype promotion cost 0.76 GiB
     /// and doubled transcription time.
     let dense: MLXArray?
-
-    public var execution: PhononExecution { projection.execution }
 
     init(packed: PhononFiveValue, execution: PhononExecution) {
         let projection = PhononProjection(packed: packed, execution: execution)

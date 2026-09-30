@@ -61,21 +61,41 @@ public struct PhononFiveValue: @unchecked Sendable {
     }
 
     /// Builds one module from the arrays of a converted file, or nil if any of
-    /// its six pieces is missing.
+    /// its six pieces is missing or has a shape the metadata does not describe.
     ///
     /// `shape` is the module's logical shape from the file's metadata. It is
     /// `[O, I]` for most modules but `[O, 1, I]` for pointwise convolutions, so
     /// the two features are read as the first and last elements, which is
     /// right for both forms without the caller having to squeeze anything.
+    ///
+    /// The dimension checks matter more than they look on the path that ships.
+    /// `dequantized()` never reads `nzTile` at all — it recomputes `seen`
+    /// incrementally from `nzRow` — and `.dequantized` drops the packed arrays
+    /// once the dense matrix exists, so a corrupt `nz_tile` is invisible there
+    /// and would only surface under the kernel. A wrong-but-in-range `nz_row`
+    /// is worse: the trits still give every weight the right sign, so the model
+    /// decodes to plausible magnitudes and produces a plausible transcript with
+    /// nothing to trip over. `tile: 0` would divide by zero computing `ntile`
+    /// in `phononFiveValueMatmul` (PhononFiveValueKernel.swift). None of this
+    /// is a consistency check across the tables — it cannot tell a valid
+    /// `nz_row` from another valid one — it only rejects arrays whose shapes
+    /// contradict the metadata.
     public static func load(from arrays: [String: MLXArray], name: String,
                             shape: [Int], tile: Int) -> PhononFiveValue? {
         guard let outFeatures = shape.first, let inFeatures = shape.last,
+              outFeatures > 0, inFeatures > 0, tile > 0,
               let trits = arrays["\(name).trits"],
               let hiBits = arrays["\(name).hi_bits"],
               let nzTile = arrays["\(name).nz_tile"],
               let nzRow = arrays["\(name).nz_row"],
               let lo = arrays["\(name).lo"],
-              let hi = arrays["\(name).hi"]
+              let hi = arrays["\(name).hi"],
+              trits.ndim == 2, trits.dim(0) == outFeatures,
+              trits.dim(1) == (inFeatures + 4) / 5,
+              nzTile.ndim == 2, nzTile.dim(0) == outFeatures,
+              nzTile.dim(1) == (inFeatures + tile - 1) / tile,
+              nzRow.size == outFeatures,
+              lo.size == outFeatures, hi.size == outFeatures
         else { return nil }
         return PhononFiveValue(trits: trits, hiBits: hiBits, nzTile: nzTile, nzRow: nzRow,
                                lo: lo, hi: hi, outFeatures: outFeatures,
