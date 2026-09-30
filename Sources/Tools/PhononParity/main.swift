@@ -1,7 +1,7 @@
 // Decode parity gate for the Phonon-2 port: proves this repo's unpacking of the
 // converted file matches Fermion's own reader, tensor by tensor.
 //
-// Usage: PhononParity <converted-model-dir> <reference-dump-dir>
+// Usage: PhononParity [--all] <converted-model-dir> <reference-dump-dir>
 //
 // The reference dump comes from Scripts/phonon2_parity.py in the app repo, which
 // decodes Fermion's original container with Fermion's own code. That is the
@@ -21,28 +21,30 @@ import MLX
 import MLXAudioSTT
 
 /// Both sides claim to produce the SAME numbers from the same bytes, so this is
-/// an equality check with a tolerance, not a similarity check. The only slack
-/// it needs is float16 rounding of the int6 tables, which costs ~1e-7. Anything
+/// an equality check with a tolerance, not a similarity check. Anything
 /// under 0.9999 is a decode bug, and a wrong trit order, bit-plane offset or
 /// row/column swap all land far below it.
 let bar = 0.9999
 
-/// The cosine bar alone is blind to a localised fault: a single wrong trit byte
-/// changes five weights out of four million and still reads 0.99999999. Fermion's
-/// reader and ours decode the same bits with the same float16 arithmetic, so for
-/// five_value the two must agree element for element, and any difference is a
-/// bug. The int6 reference is float32 while we emit float16, so those may differ
-/// by float16 rounding (half an ulp, 2^-11 relative) and no more.
-func mismatches(_ a: [Float], _ b: [Float], exact: Bool) -> (count: Int, maxAbs: Float) {
+/// The cosine bar alone is blind to a localised fault, measured on real
+/// corruptions: a flipped trit changes one byte but mis-aligns `hi_bits` for the
+/// rest of that row, giving a couple of hundred wrong elements and a cosine of
+/// about 0.99997, still above the bar; a wrong `nz_tile` entry, or one wrong int6
+/// byte, reads 1.0 and 0.99999998. So elements are compared one by one, and
+/// exactly. Five_value is float16 on both sides. The int6 reference is float32
+/// while we emit float16, so it is rounded to float16 first, which is what the
+/// port's own arithmetic does; any slack wider than that (half an ulp is
+/// 2^-11 relative) lets a one-ulp corruption of a scale through.
+func mismatches(_ a: [Float], _ b: [Float]) -> (count: Int, maxAbs: Float) {
     var count = 0
     var maxAbs: Float = 0
     for i in 0..<a.count {
-        let d = abs(a[i] - b[i])
-        // NaN compares false on both sides of `>`, so test it explicitly.
-        if d.isNaN { count += 1; maxAbs = .infinity; continue }
-        maxAbs = max(maxAbs, d)
-        let slack: Float = exact ? 0 : abs(b[i]) * 0x1p-10 + 1e-7
-        if d > slack { count += 1 }
+        let want = Float(Float16(b[i]))
+        // NaN compares unequal to everything, itself included, so it counts.
+        if a[i] == want { continue }
+        count += 1
+        maxAbs = max(maxAbs, abs(a[i] - want))
+        if a[i].isNaN || want.isNaN { maxAbs = .infinity }
     }
     return (count, maxAbs)
 }
@@ -55,7 +57,9 @@ How to read a failure:
   mirrored values                        lo/hi swapped
   right magnitudes, wrong signs          sign = code - 1 inverted (cosine near -1)
   int6 only                              6-bit groups read big-endian, or the +32 bias dropped
-  cosine fine but mismatched > 0         a localised fault: one wrong byte, one nz_row
+  cosine fine but mismatched > 0         a localised fault: one wrong byte, one nz_row, one int6 scale
+  coverage failures                      the dump is truncated or wrong, not the decode: regenerate it
+                                         with Scripts/phonon2_parity.py (add --all for --all)
   nz tables bad > 0                      nz_tile / nz_row disagree with the reference's non-zero
                                          pattern; decoding may still be right, a kernel would not be
 Do not proceed to the kernel until every module passes: a kernel checked
@@ -119,9 +123,16 @@ func fail(_ message: String) -> Never {
     exit(2)
 }
 
-let args = CommandLine.arguments
-guard args.count == 3 else { fail("usage: PhononParity <converted-model-dir> <reference-dump-dir>") }
-let modelDir = URL(fileURLWithPath: args[1]), refDir = URL(fileURLWithPath: args[2])
+// --all demands a reference for every five_value module in the file rather than
+// the sampled set. It needs a dump made with `phonon2_parity.py --all` and is
+// the pre-release run; the default is the quick one.
+var args = Array(CommandLine.arguments.dropFirst())
+let requireAll = args.contains("--all")
+args.removeAll { $0 == "--all" }
+guard args.count == 2 else {
+    fail("usage: PhononParity [--all] <converted-model-dir> <reference-dump-dir>")
+}
+let modelDir = URL(fileURLWithPath: args[0]), refDir = URL(fileURLWithPath: args[1])
 
 let arrays: [String: MLXArray]
 let metadata: [String: String]
@@ -151,6 +162,7 @@ do {
 var failures = 0
 var checked: (five: Int, int6: Int) = (0, 0)
 var coveredInt6 = Set<String>()
+var coveredFive = Set<String>()
 
 print("bar \(bar); \(listing.count) reference tensors, model has \(packed.count) five_value + \(int6.count) int6 modules\n")
 
@@ -176,6 +188,7 @@ for ref in listing {
         }
         decoded = module.dequantized()
         fiveValue = module
+        coveredFive.insert(entry.name)
         checked.five += 1
     case "int6":
         guard let entry = int6.first(where: { $0.name == ref.module }),
@@ -204,7 +217,7 @@ for ref in listing {
     let a = flat(decoded), b = flat(want)
     let cos = cosine(a, b)
     // Written so NaN fails: `cos < bar` would be false for NaN and pass it.
-    let diff = mismatches(a, b, exact: kind == "five_value")
+    let diff = mismatches(a, b)
     let tableBad = fiveValue.map { tableMismatches($0, reference: b) } ?? 0
     let ok = cos >= bar && diff.count == 0 && tableBad == 0
     if !ok { failures += 1 }
@@ -222,14 +235,42 @@ for ref in listing {
     print(line)
 }
 
-// A gate that quietly skips a table certifies nothing about it. There are only
-// nine, so all of them are required; five_value is a sample by design.
+// A gate that quietly skips a table certifies nothing about it, and one whose
+// dump was truncated would otherwise pass having checked nothing. There are only
+// nine int6 tables, so all are required.
 for entry in int6 where !coveredInt6.contains(entry.name) {
     print("FAIL  int6  \(entry.name): in the file but absent from the reference dump")
     failures += 1
 }
 
-print("\nchecked \(checked.five) of \(packed.count) five_value and \(checked.int6) of \(int6.count) int6 modules")
+// For five_value a sample is enough by design, but it must span every distinct
+// geometry in the file: the shapes are the fault classes that matter (a kernel
+// tile bug shows on one shape and not another), and a dump that lost a shape
+// class is exactly the silent regression to catch. `[O, 1, I]` pointwise
+// convolutions count by their `[O, I]`, the geometry a kernel sees.
+func shapeName(_ entry: PhononPackedEntry) -> String {
+    "\(entry.shape.first ?? 0)x\(entry.shape.last ?? 0)"
+}
+let shapesInFile = Set(packed.map(shapeName))
+let shapesChecked = Set(packed.filter { coveredFive.contains($0.name) }.map(shapeName))
+if packed.isEmpty || checked.five == 0 {
+    print("FAIL  coverage: no five_value module was checked, so nothing about the packed weights is certified")
+    failures += 1
+}
+let unchecked = shapesInFile.subtracting(shapesChecked).sorted()
+if !unchecked.isEmpty {
+    print("FAIL  coverage: \(unchecked.count) of \(shapesInFile.count) five_value shapes unchecked: \(unchecked.joined(separator: ", "))")
+    failures += 1
+}
+if requireAll {
+    let missing = packed.filter { !coveredFive.contains($0.name) }
+    if !missing.isEmpty {
+        print("FAIL  coverage: --all, but \(missing.count) of \(packed.count) five_value modules have no reference, first: \(missing[0].name)")
+        failures += 1
+    }
+}
+
+print("\nchecked \(checked.five) of \(packed.count) five_value (\(shapesChecked.count) of \(shapesInFile.count) shapes) and \(checked.int6) of \(int6.count) int6 modules\(requireAll ? " [--all]" : "")")
 if failures > 0 {
     print("\nGATE FAILED: \(failures) problem(s)")
     print(diagnosis)
