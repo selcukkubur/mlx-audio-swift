@@ -41,8 +41,20 @@ final class PhononProjection: @unchecked Sendable {
     /// fallback is supposed to cost, and the fallback's memory figure is half of
     /// what the speed gate is deciding.
     let packed: PhononFiveValue?
-    /// `[O, I]` float16, present only in `.dequantized`.
+    /// `[O, I]`, present only in `.dequantized`. Decoded as float16; the loader's
+    /// compute-dtype cast may convert it afterwards.
+    ///
+    /// Whoever holds this must make sure it is reachable by that cast. MLX casts
+    /// a parameter with `_updateInternal`, which mutates the `MLXArray` object in
+    /// place, so a layer that hands this same object to the parameter tree gets
+    /// the conversion for free — and a layer that keeps it only here does not.
+    /// `PhononPointwiseConv1d` was the second kind, and at bfloat16 it cost
+    /// 0.76 GiB and half the speed until it stopped being.
     let dense: MLXArray?
+
+    /// The dtype of the decoded matrix, or nil in `.kernel`. The loader checks
+    /// this after casting rather than trusting the paragraph above.
+    var denseDType: DType? { dense?.dtype }
 
     init(packed: PhononFiveValue, execution: PhononExecution) {
         self.execution = execution
@@ -92,6 +104,15 @@ final class PhononProjection: @unchecked Sendable {
     }
 }
 
+/// A layer whose weights came from a packed block.
+///
+/// The loader uses this to count what it swapped in and to check that the
+/// compute-dtype cast reached every decoded matrix. Both are cheap; both replace
+/// an assumption that has already been wrong once.
+protocol PhononPackedLayer: Module {
+    var packedProjection: PhononProjection { get }
+}
+
 /// `Linear` backed by a five-value packed matrix.
 ///
 /// A subclass rather than a protocol both dense and packed layers satisfy. The
@@ -103,10 +124,26 @@ final class PhononProjection: @unchecked Sendable {
 /// rewritten to admit a format most callers will never use. Subclassing changes
 /// nothing outside this file and is the route MLX takes itself
 /// (`QuantizedLinear: Linear`).
-public final class PhononLinear: Linear {
+public final class PhononLinear: Linear, PhononPackedLayer {
     let projection: PhononProjection
 
+    var packedProjection: PhononProjection { projection }
+
     public var execution: PhononExecution { projection.execution }
+
+    /// The dimensions of the matrix this layer applies, not of whatever is in
+    /// `weight`.
+    ///
+    /// In `.kernel` `weight` is a 1x1 placeholder, so the inherited `shape` would
+    /// describe 216 real projections as 1x1. This override fixes the accessor.
+    /// It does **not** fix the parameter: `parameters()` still emits the
+    /// placeholder, so a kernel-mode model must not be re-saved or re-verified
+    /// against a checkpoint — it would write a 1x1 weight and read back nothing
+    /// usable. Nothing in this repo does that today; anything that starts to
+    /// needs to reconstitute the matrix from `projection.packed` first.
+    public override var shape: (Int, Int) {
+        (projection.outFeatures, projection.inFeatures)
+    }
 
     /// In `.dequantized` the decoded matrix is installed as `weight`, so the
     /// inherited `callAsFunction` runs and the fallback is the ordinary dense
@@ -152,16 +189,34 @@ public final class PhononLinear: Linear {
 ///
 /// Unlike `Linear`, `Conv1d` has no `init(weight:bias:)` and its `weight` and
 /// `bias` are `let`s set by its own initialiser, so both modes go through
-/// `projection` here and `weight` is always a placeholder. Every packed module
-/// in this checkpoint is bias-free and the loader rejects one that is not, so
-/// there is no bias to carry.
-public final class PhononPointwiseConv1d: Conv1d {
+/// `projection` here and `weight` is always a 1x1x1 placeholder. As in
+/// `PhononLinear`, that placeholder is what `parameters()` emits, so one of
+/// these must not be re-saved or re-verified against a checkpoint. Every packed
+/// module in this checkpoint is bias-free and the loader rejects one that is
+/// not, so there is no bias to carry.
+public final class PhononPointwiseConv1d: Conv1d, PhononPackedLayer {
     let projection: PhononProjection
+
+    var packedProjection: PhononProjection { projection }
+
+    /// The decoded matrix again — the same object `projection.dense` holds, not a
+    /// copy — declared here so that `Module`'s reflection sees it and the
+    /// loader's compute-dtype cast reaches it.
+    ///
+    /// `PhononLinear` gets this for nothing because its decoded matrix *is* its
+    /// `weight`. This layer cannot do that: `Conv1d.weight` is a `let` set by the
+    /// superclass initialiser and is the wrong rank besides. Without this
+    /// declaration the 48 pointwise convolutions stayed float16 while everything
+    /// else converted, and at bfloat16 that mixed-dtype promotion cost 0.76 GiB
+    /// and doubled transcription time.
+    let dense: MLXArray?
 
     public var execution: PhononExecution { projection.execution }
 
     init(packed: PhononFiveValue, execution: PhononExecution) {
-        self.projection = PhononProjection(packed: packed, execution: execution)
+        let projection = PhononProjection(packed: packed, execution: execution)
+        self.projection = projection
+        self.dense = projection.dense
         super.init(inputChannels: 1, outputChannels: 1, kernelSize: 1, bias: false)
     }
 

@@ -82,6 +82,7 @@ private struct Options {
     /// Phonon-2: a local directory of packed weights, loaded instead of a repo id.
     var phononDir: String? = nil
     var phononMode: PhononExecution = .dequantized
+    var phononDType: DType = .float16
     /// Transcriptions to run. The first is a warm-up and is reported as such:
     /// MLX compiles the Metal kernel on its first call, and that compile is not
     /// part of what the speed gate is comparing.
@@ -154,6 +155,14 @@ private struct Options {
                 guard let v = it.next() else { throw CLIError.missingValue(arg) }
                 guard let mode = PhononExecution(rawValue: v) else { throw CLIError.invalidValue(arg, v) }
                 options.phononMode = mode
+            case "--phonon-dtype":
+                guard let v = it.next() else { throw CLIError.missingValue(arg) }
+                switch v {
+                case "float16": options.phononDType = .float16
+                case "bfloat16": options.phononDType = .bfloat16
+                case "float32": options.phononDType = .float32
+                default: throw CLIError.invalidValue(arg, v)
+                }
             case "--repeat":
                 guard let v = it.next() else { throw CLIError.missingValue(arg) }
                 guard let value = Int(v), value >= 1 else { throw CLIError.invalidValue(arg, v) }
@@ -264,6 +273,8 @@ private struct Options {
               --phonon-mode <kernel|dequantized>
                                             How packed weights are read. Default: dequantized
                                             (the speed gate's ruling; kernel is 622x slower)
+              --phonon-dtype <float16|bfloat16|float32>
+                                            Compute dtype for the packed model. Default: float16
               --repeat <int>                Transcribe this many times, timing each. Run 1 is a
                                             warm-up (kernel compile) and is labelled as such. Default: 1
               -h, --help                    Show this help
@@ -295,14 +306,15 @@ enum App {
         let model: LoadedModel
         if let phononDir = options.phononDir {
             model = .stt(try ParakeetModel.fromPhononDirectory(
-                resolveURL(path: phononDir), execution: options.phononMode))
+                resolveURL(path: phononDir), execution: options.phononMode,
+                computeDType: options.phononDType))
         } else {
             model = try await loadModel(repo: options.model)
         }
         let loadElapsed = CFAbsoluteTimeGetCurrent() - loadStart
         if options.phononDir != nil {
-            print(String(format: "phonon: mode=%@  load %.3f s  rss %.3f GB  peak-rss %.3f GB  footprint %.3f GB  peak-footprint %.3f GB",
-                         options.phononMode.rawValue, loadElapsed,
+            print(String(format: "phonon: mode=%@ dtype=%@  load %.3f s  rss %.3f GB  peak-rss %.3f GB  footprint %.3f GB  peak-footprint %.3f GB",
+                         options.phononMode.rawValue, "\(options.phononDType)", loadElapsed,
                          residentGB(), peakResidentGB(), footprintGB(), peakFootprintGB()))
             fflush(stdout)
         }

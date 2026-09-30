@@ -1176,6 +1176,17 @@ public extension ParakeetModel {
         arrays.removeAll()
         model.update(modules: ModuleChildren.unflattened(replacements))
 
+        // The coverage check above proved the metadata accounts for the model.
+        // This proves the swap actually happened: `update(modules:)` reports
+        // nothing, and a replacement that failed to take would leave a randomly
+        // initialised dense layer behind that still has the right shape and
+        // still transcribes something.
+        var swapped = 0
+        for (_, module) in model.namedModules() where module is PhononPackedLayer { swapped += 1 }
+        guard swapped == packed.count else {
+            throw PhononLoadError.swapIncomplete(expected: packed.count, found: swapped)
+        }
+
         model.computeDType = computeDType
 
         let casted = Dictionary(
@@ -1187,6 +1198,22 @@ public extension ParakeetModel {
             }
         )
         try model.update(parameters: ModuleParameters.unflattened(casted), verify: .noUnusedKeys)
+
+        // And this proves the cast reached the decoded matrices. It reaches them
+        // only because each packed layer hands the same `MLXArray` object to the
+        // parameter tree, and MLX casts a parameter by mutating that object in
+        // place. That is a property of two files agreeing with each other, which
+        // is the kind of agreement that lapses silently: the pointwise
+        // convolutions did not hand theirs over, stayed float16 while the rest of
+        // the model became bfloat16, and cost 0.76 GiB and half the speed to
+        // mixed-dtype promotion. Checked here so it cannot lapse again quietly.
+        for (path, module) in model.namedModules() {
+            guard let layer = module as? PhononPackedLayer,
+                  let dtype = layer.packedProjection.denseDType,
+                  dtype != computeDType
+            else { continue }
+            throw PhononLoadError.uncastWeights(path, found: dtype, expected: computeDType)
+        }
 
         model.train(false)
         eval(model)
@@ -1210,6 +1237,8 @@ public enum PhononLoadError: Error, CustomStringConvertible {
     case noSuchModule(String)
     case shapeDisagreement(String, [Int], [Int])
     case unsupportedModule(String, String)
+    case swapIncomplete(expected: Int, found: Int)
+    case uncastWeights(String, found: DType, expected: DType)
 
     public var description: String {
         switch self {
@@ -1235,6 +1264,11 @@ public enum PhononLoadError: Error, CustomStringConvertible {
             "\(path) is \(found) but its packed block is \(expected)"
         case .unsupportedModule(let path, let type):
             "\(path) is a \(type); only Linear and pointwise Conv1d can be backed by packed weights"
+        case .swapIncomplete(let expected, let found):
+            "\(expected) packed blocks but only \(found) module(s) became packed layers"
+        case .uncastWeights(let path, let found, let expected):
+            "\(path) kept its weights as \(found) while the model computes in \(expected); "
+                + "the decoded matrix is not reachable by the compute-dtype cast"
         }
     }
 }
