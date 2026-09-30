@@ -154,7 +154,9 @@ let kernelSteps = [1, 7]
 /// rounding error of a sum of I terms, which grows like sqrt(I) * 2^-24 times
 /// the sum of the terms' magnitudes (not the sum itself, which cancels). 2^-23
 /// gives that a factor of two of slack. Measured against float16 rounding it is
-/// about four orders smaller, so it only matters where an output nearly cancels.
+/// about 5% of a ulp on the real modules, so on its own it would not rescue a
+/// wrong result; it only matters where an output nearly cancels and the ulp term
+/// shrinks with it.
 ///
 /// The tolerance is taken per element from that element's own magnitude rather
 /// than once from the largest output. A single bound sized by the largest
@@ -491,6 +493,19 @@ if runKernel {
     // certified nothing, and must not read as a pass.
     if coveredKernel.isEmpty {
         print("FAIL  coverage: --kernel, but no module was kernel-checked, so nothing about the kernel is certified")
+        failures += 1
+    }
+    // `kernelRuns == checked.five * kernelSteps.count` passes as `0 == 0` if
+    // `kernelSteps` is ever emptied, so the run count is held against zero in its
+    // own right. The batch sizes are checked too: a list of nothing but T=1 would
+    // certify a kernel that indexes the time axis wrongly, which is the failure
+    // this stage exists to catch.
+    if kernelRuns == 0 {
+        print("FAIL  coverage: --kernel, but no kernel run happened at all")
+        failures += 1
+    }
+    if !kernelSteps.contains(where: { $0 > 1 }) {
+        print("FAIL  coverage: kernelSteps is \(kernelSteps), which never batches over time")
         failures += 1
     }
     if coveredKernel.count != checked.five || kernelRuns != checked.five * kernelSteps.count {

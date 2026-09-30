@@ -76,6 +76,25 @@ let phononKernelSource = """
     }
 """
 
+/// The kernel object, built once for the process.
+///
+/// It is a description of the kernel, not the compiled pipeline — MLX caches
+/// that behind it — but rebuilding the description allocated an object and
+/// re-hashed the source text on every matmul, and one transcription makes tens
+/// of thousands of them.
+///
+/// `nonisolated(unsafe)` because the type is not declared `Sendable`. It is
+/// immutable once built and MLX guards its own kernel cache, so the only thing
+/// being asserted here is that a `let` nobody writes can be read from more than
+/// one task.
+nonisolated(unsafe) let phononFiveValueKernel = MLXFast.metalKernel(
+    name: "phonon_five_value",
+    inputNames: ["x", "trits", "hi_bits", "nz_tile", "nz_row", "lo", "hi"],
+    outputNames: ["out"],
+    source: phononKernelSource,
+    header: phononKernelHeader
+)
+
 /// `x` is `[..., I]`; the result is `[..., O]`, float16.
 ///
 /// Every call site is batched over time, so the leading dimensions are
@@ -88,16 +107,9 @@ public func phononFiveValueMatmul(_ x: MLXArray, _ w: PhononFiveValue) -> MLXArr
     let steps = leading.reduce(1, *)
     let x2 = x.reshaped([steps, w.inFeatures])
 
-    let kernel = MLXFast.metalKernel(
-        name: "phonon_five_value",
-        inputNames: ["x", "trits", "hi_bits", "nz_tile", "nz_row", "lo", "hi"],
-        outputNames: ["out"],
-        source: phononKernelSource,
-        header: phononKernelHeader
-    )
     let ntile = (w.inFeatures + w.tile - 1) / w.tile
     let group = min(w.tile, 256)
-    let out = kernel(
+    let out = phononFiveValueKernel(
         [x2, w.trits, w.hiBits, w.nzTile, w.nzRow, w.lo, w.hi],
         template: [("O", w.outFeatures), ("I", w.inFeatures),
                    ("TILE", w.tile), ("NTILE", ntile)],
