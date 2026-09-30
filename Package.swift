@@ -61,6 +61,10 @@ let package = Package(
             name: "NemotronParity",
             targets: ["NemotronParity"],
         ),
+        .executable(
+            name: "PhononParity",
+            targets: ["PhononParity"],
+        ),
 
     ],
     dependencies: [
@@ -292,6 +296,18 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Sources/Tools/NemotronParity"
+        ),
+        // Decode parity gate for the Phonon-2 port: compares PhononFiveValue
+        // and PhononInt6 decoding of a converted model against a dump made by
+        // Fermion's own reader. Run it before trusting any kernel built on
+        // that decode.
+        .executableTarget(
+            name: "PhononParity",
+            dependencies: [
+                "MLXAudioSTT",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Sources/Tools/PhononParity"
         ),
 
         // MARK: - Tests
