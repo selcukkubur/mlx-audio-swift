@@ -79,6 +79,14 @@ private struct Options {
     var genKwargsRaw: String? = nil
     var text = ""
 
+    /// Phonon-2: a local directory of packed weights, loaded instead of a repo id.
+    var phononDir: String? = nil
+    var phononMode: PhononExecution = .dequantized
+    /// Transcriptions to run. The first is a warm-up and is reported as such:
+    /// MLX compiles the Metal kernel on its first call, and that compile is not
+    /// part of what the speed gate is comparing.
+    var repeatCount = 1
+
     var temperature: Float? = nil
     var topP: Float? = nil
     var topK: Int? = nil
@@ -139,6 +147,17 @@ private struct Options {
             case "--text":
                 guard let v = it.next() else { throw CLIError.missingValue(arg) }
                 options.text = v
+            case "--phonon-dir":
+                guard let v = it.next() else { throw CLIError.missingValue(arg) }
+                options.phononDir = v
+            case "--phonon-mode":
+                guard let v = it.next() else { throw CLIError.missingValue(arg) }
+                guard let mode = PhononExecution(rawValue: v) else { throw CLIError.invalidValue(arg, v) }
+                options.phononMode = mode
+            case "--repeat":
+                guard let v = it.next() else { throw CLIError.missingValue(arg) }
+                guard let value = Int(v), value >= 1 else { throw CLIError.invalidValue(arg, v) }
+                options.repeatCount = value
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -241,6 +260,12 @@ private struct Options {
                                             stream, text, verbose, context, prefill_step_size,
                                             frame_threshold
               --text <text>                 Alignment text (required for forced aligner models)
+              --phonon-dir <path>           Load a Phonon-2 packed model directory instead of --model
+              --phonon-mode <kernel|dequantized>
+                                            How packed weights are read. Default: dequantized
+                                            (the speed gate's ruling; kernel is 622x slower)
+              --repeat <int>                Transcribe this many times, timing each. Run 1 is a
+                                            warm-up (kernel compile) and is labelled as such. Default: 1
               -h, --help                    Show this help
             """
         )
@@ -266,7 +291,21 @@ enum App {
             throw AppError.inputFileNotFound(inputURL.path)
         }
 
-        let model = try await loadModel(repo: options.model)
+        let loadStart = CFAbsoluteTimeGetCurrent()
+        let model: LoadedModel
+        if let phononDir = options.phononDir {
+            model = .stt(try ParakeetModel.fromPhononDirectory(
+                resolveURL(path: phononDir), execution: options.phononMode))
+        } else {
+            model = try await loadModel(repo: options.model)
+        }
+        let loadElapsed = CFAbsoluteTimeGetCurrent() - loadStart
+        if options.phononDir != nil {
+            print(String(format: "phonon: mode=%@  load %.3f s  rss %.3f GB  peak-rss %.3f GB  footprint %.3f GB  peak-footprint %.3f GB",
+                         options.phononMode.rawValue, loadElapsed,
+                         residentGB(), peakResidentGB(), footprintGB(), peakFootprintGB()))
+            fflush(stdout)
+        }
         let (inputSampleRate, inputAudio) = try loadAudioArray(from: inputURL)
         let audio = try prepareAudioForSTT(inputAudio, inputSampleRate: inputSampleRate, targetSampleRate: 16000)
 
@@ -311,7 +350,24 @@ enum App {
             if options.stream {
                 output = try await runStreaming(model: sttModel, audio: audio, parameters: params)
             } else {
-                output = sttModel.generate(audio: audio, generationParameters: params)
+                var last: STTOutput?
+                for run in 1...options.repeatCount {
+                    let runStart = CFAbsoluteTimeGetCurrent()
+                    let result = sttModel.generate(audio: audio, generationParameters: params)
+                    let runElapsed = CFAbsoluteTimeGetCurrent() - runStart
+                    if options.repeatCount > 1 || options.phononDir != nil {
+                        // Every run is printed, warm-up included, so the report can
+                        // show what was discarded rather than assert it.
+                        print(String(format: "run %d/%d%@: %.3f s  rss %.3f GB  peak-rss %.3f GB  footprint %.3f GB  peak-footprint %.3f GB",
+                                     run, options.repeatCount, run == 1 ? " (warm-up)" : "",
+                                     runElapsed, residentGB(), peakResidentGB(),
+                                     footprintGB(), peakFootprintGB()))
+                        fflush(stdout)
+                    }
+                    last = result
+                }
+                guard let last else { fatalError("--repeat must run at least once") }
+                output = last
             }
 
         case .forcedAligner(let aligner):
@@ -442,6 +498,58 @@ enum App {
         }
         if emitted { print() }
         return output
+    }
+
+    /// Current and high-water resident set of this process, in GB.
+    ///
+    /// `mach_task_basic_info` is the process's own view of the same number
+    /// `/usr/bin/time -l` reports as "maximum resident set size", and on Apple
+    /// silicon it includes MLX's unified-memory buffers, which is the whole point
+    /// of measuring it. Estimating from tensor sizes would miss the allocator.
+    private static func taskInfo() -> mach_task_basic_info? {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? info : nil
+    }
+
+    private static func residentGB() -> Double {
+        Double(taskInfo()?.resident_size ?? 0) / 1_073_741_824.0
+    }
+
+    private static func peakResidentGB() -> Double {
+        Double(taskInfo()?.resident_size_max ?? 0) / 1_073_741_824.0
+    }
+
+    /// Phys-footprint, current and high-water — what `/usr/bin/time -l` calls
+    /// "peak memory footprint".
+    ///
+    /// Reported alongside RSS because on Apple silicon MLX's tensors live in
+    /// unified-memory Metal buffers that the resident-set counters do not see:
+    /// a model measured by RSS alone reads about a third of its real size.
+    private static func vmInfo() -> task_vm_info? {
+        var info = task_vm_info()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return result == KERN_SUCCESS ? info : nil
+    }
+
+    private static func footprintGB() -> Double {
+        Double(vmInfo()?.phys_footprint ?? 0) / 1_073_741_824.0
+    }
+
+    private static func peakFootprintGB() -> Double {
+        Double(vmInfo()?.ledger_phys_footprint_peak ?? 0) / 1_073_741_824.0
     }
 
     private static func loadModel(repo: String) async throws -> LoadedModel {

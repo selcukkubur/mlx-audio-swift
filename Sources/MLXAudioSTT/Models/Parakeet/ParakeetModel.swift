@@ -947,68 +947,10 @@ public extension ParakeetModel {
         _ modelDir: URL,
         computeDType: DType = .bfloat16
     ) throws -> ParakeetModel {
-        let configURL = modelDir.appendingPathComponent("config.json")
-        let rawConfigData = try Data(contentsOf: configURL)
-        let configData = normalizedConfigData(rawConfigData)
+        let configData = try readConfig(modelDir)
         let rawConfig = try JSONDecoder().decode(ParakeetRawConfig.self, from: configData)
         let quantConfig = try JSONDecoder().decode(ParakeetQuantizationConfig.self, from: configData)
-        let variant = try ParakeetVariantResolver.resolve(rawConfig)
-
-        let model: ParakeetModel
-        switch variant {
-        case .tdt:
-            let cfg = try ParakeetConfigParser.parseTDT(rawConfig)
-            model = ParakeetModel(
-                variant: .tdt,
-                preprocessConfig: cfg.preprocessor,
-                encoderConfig: cfg.encoder,
-                vocabulary: cfg.joint.vocabulary,
-                durations: cfg.decoding.durations,
-                maxSymbols: cfg.decoding.greedy?.maxSymbols,
-                decoderConfig: cfg.decoder,
-                jointConfig: cfg.joint,
-                ctcConfig: nil
-            )
-        case .tdtCtc:
-            let cfg = try ParakeetConfigParser.parseTDTCTC(rawConfig)
-            model = ParakeetModel(
-                variant: .tdtCtc,
-                preprocessConfig: cfg.preprocessor,
-                encoderConfig: cfg.encoder,
-                vocabulary: cfg.joint.vocabulary,
-                durations: cfg.decoding.durations,
-                maxSymbols: cfg.decoding.greedy?.maxSymbols,
-                decoderConfig: cfg.decoder,
-                jointConfig: cfg.joint,
-                ctcConfig: cfg.auxCTC.decoder
-            )
-        case .rnnt:
-            let cfg = try ParakeetConfigParser.parseRNNT(rawConfig)
-            model = ParakeetModel(
-                variant: .rnnt,
-                preprocessConfig: cfg.preprocessor,
-                encoderConfig: cfg.encoder,
-                vocabulary: cfg.joint.vocabulary,
-                durations: [1],
-                maxSymbols: cfg.decoding.greedy?.maxSymbols,
-                decoderConfig: cfg.decoder,
-                jointConfig: cfg.joint,
-                ctcConfig: nil
-            )
-        case .ctc:
-            let cfg = try ParakeetConfigParser.parseCTC(rawConfig)
-            model = ParakeetModel(
-                variant: .ctc,
-                preprocessConfig: cfg.preprocessor,
-                encoderConfig: cfg.encoder,
-                vocabulary: cfg.decoder.vocabulary,
-                durations: [1],
-                maxSymbols: nil,
-                decoderConfig: nil,
-                jointConfig: nil,
-                ctcConfig: cfg.decoder
-            )
-        }
+        let model = try makeModel(rawConfig)
 
         var weights: [String: MLXArray] = [:]
         let files = try FileManager.default.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil)
@@ -1075,9 +1017,301 @@ public extension ParakeetModel {
         )
         return try fromDirectory(modelDir, computeDType: computeDType)
     }
+
+    /// Loads a model whose big matrices are in Fermion's Phonon-2 packing.
+    ///
+    /// The file is self-describing: its safetensors metadata lists every packed
+    /// module under `phonon_packed` (five-value) and `phonon_int6`, each with the
+    /// **exact** logical tensor it replaces. That name is used as given — `.weight`
+    /// is never appended to it, because four of the int6 tables (the LSTM `Wx`
+    /// and `Wh`) genuinely have no such suffix and appending one would load a
+    /// different tensor without complaining.
+    ///
+    /// The nine int6 tables are decoded to float16 at load in both modes: there
+    /// is no int6 kernel, they are about 45 MB dequantised, and decoding them
+    /// identically either way keeps the two five-value modes the only difference
+    /// between the runs the speed gate compares.
+    ///
+    /// `computeDType` defaults to `.float16` rather than the `.bfloat16` the fp16
+    /// loader uses. Everything in the packed file is float16 and the kernel emits
+    /// float16; running the rest of the graph in bfloat16 would promote every
+    /// residual add to float32, and would do so differently in the two modes, so
+    /// the gate would be timing a dtype difference as much as an arithmetic one.
+    ///
+    /// `execution` defaults to `.dequantized` because that is what the speed
+    /// gate ruled on 2026-09-30: the kernel had to be within 1.5x of the dense
+    /// path to ship and measured 622x slower on the same audio (13.881 s against
+    /// 0.022 s). `.kernel` is kept, correct and reachable, but only when asked
+    /// for by name. See `docs/phonon-2-benchmark.md` in the app repo.
+    ///
+    /// - Parameters:
+    ///   - modelDir: a directory holding `config.json` and a packed `model.safetensors`.
+    ///   - execution: `.kernel` reads the packed bytes; `.dequantized` expands
+    ///     them once at load and runs ordinary dense matmuls afterwards.
+    static func fromPhononDirectory(
+        _ modelDir: URL,
+        execution: PhononExecution = .dequantized,
+        computeDType: DType = .float16
+    ) throws -> ParakeetModel {
+        let configData = try readConfig(modelDir)
+        let rawConfig = try JSONDecoder().decode(ParakeetRawConfig.self, from: configData)
+        let model = try makeModel(rawConfig)
+
+        let weightsURL = modelDir.appendingPathComponent("model.safetensors")
+        var arrays: [String: MLXArray]
+        let metadata: [String: String]
+        (arrays, metadata) = try MLX.loadArraysAndMetadata(url: weightsURL)
+
+        guard let packedJSON = metadata["phonon_packed"], let int6JSON = metadata["phonon_int6"] else {
+            throw PhononLoadError.notPacked(weightsURL.path)
+        }
+        let packed = try JSONDecoder().decode([PhononPackedEntry].self, from: Data(packedJSON.utf8))
+        let int6 = try JSONDecoder().decode([PhononInt6Entry].self, from: Data(int6JSON.utf8))
+
+        let fivePieces = ["trits", "hi_bits", "nz_tile", "nz_row", "lo", "hi"]
+        let int6Pieces = ["q6", "scale"]
+
+        // Everything that is not a piece of a packed block is plain float16 and
+        // loads the way it always did.
+        var pieceKeys = Set<String>()
+        for entry in packed { for piece in fivePieces { pieceKeys.insert("\(entry.name).\(piece)") } }
+        for entry in int6 { for piece in int6Pieces { pieceKeys.insert("\(entry.name).\(piece)") } }
+        var plain: [String: MLXArray] = [:]
+        plain.reserveCapacity(arrays.count - pieceKeys.count)
+        for (key, value) in arrays where !pieceKeys.contains(key) { plain[key] = value }
+
+        var sanitized = sanitize(weights: plain, variant: model.variant)
+
+        // int6, decoded now. Each table's pieces are dropped from `arrays` as it
+        // is consumed so the packed bytes are not held alongside the float16
+        // they decode to.
+        for entry in int6 {
+            guard let table = PhononInt6.load(from: arrays, name: entry.name, shape: entry.shape) else {
+                throw PhononLoadError.incompleteBlock(entry.name, kind: "int6")
+            }
+            for piece in int6Pieces { arrays.removeValue(forKey: "\(entry.name).\(piece)") }
+            guard let key = remapKey(entry.tensor, variant: model.variant) else {
+                throw PhononLoadError.unmappableTensor(entry.tensor)
+            }
+            let dense = table.dequantized()
+            eval(dense)
+            guard sanitized.updateValue(dense, forKey: key) == nil else {
+                throw PhononLoadError.duplicateTensor(key)
+            }
+        }
+
+        // Which model parameters the five-value blocks are expected to supply.
+        // Checked before the load rather than after: `verify: .all` cannot be
+        // used here (those keys are legitimately absent from `sanitized`), and
+        // dropping the check with it would let a genuinely missing plain tensor
+        // through as a randomly initialised weight.
+        var expectedFromPacked = Set<String>()
+        for entry in packed {
+            guard let key = remapKey(entry.tensor, variant: model.variant) else {
+                throw PhononLoadError.unmappableTensor(entry.tensor)
+            }
+            guard key.hasSuffix(".weight") else {
+                throw PhononLoadError.unexpectedPackedTensor(entry.tensor)
+            }
+            guard expectedFromPacked.insert(key).inserted else {
+                throw PhononLoadError.duplicateTensor(key)
+            }
+        }
+        let modelKeys = Set(model.parameters().flattened().map { $0.0 })
+        let missing = modelKeys.subtracting(sanitized.keys)
+        guard missing == expectedFromPacked else {
+            throw PhononLoadError.coverage(
+                unexplained: missing.subtracting(expectedFromPacked).sorted(),
+                unused: expectedFromPacked.subtracting(missing).sorted()
+            )
+        }
+
+        try model.update(
+            parameters: ModuleParameters.unflattened(sanitized),
+            verify: [.noUnusedKeys, .shapeMismatch])
+
+        // Now swap the packed layers in. The replacements subclass the types the
+        // conformer already declares, so nothing in the conformer changes; see
+        // `PhononLinear` for why that route was taken over a protocol.
+        var leaves: [String: Module] = [:]
+        for (path, module) in model.leafModules().flattened() { leaves[path] = module }
+
+        var replacements: [(String, Module)] = []
+        replacements.reserveCapacity(packed.count)
+        for entry in packed {
+            guard let key = remapKey(entry.tensor, variant: model.variant) else {
+                throw PhononLoadError.unmappableTensor(entry.tensor)
+            }
+            let path = String(key.dropLast(".weight".count))
+            guard let module = leaves[path] else {
+                throw PhononLoadError.noSuchModule(path)
+            }
+            guard let five = PhononFiveValue.load(
+                from: arrays, name: entry.name, shape: entry.shape, tile: entry.tile)
+            else {
+                throw PhononLoadError.incompleteBlock(entry.name, kind: "five_value")
+            }
+            for piece in fivePieces { arrays.removeValue(forKey: "\(entry.name).\(piece)") }
+
+            switch module {
+            case let conv as Conv1d:
+                // A 1x1 convolution is a projection; anything else is not, and
+                // substituting a matmul for it would be wrong rather than slow.
+                guard conv.weight.shape == [five.outFeatures, 1, five.inFeatures],
+                      conv.stride == 1, conv.padding == 0, conv.dilation == 1, conv.groups == 1,
+                      conv.bias == nil
+                else {
+                    throw PhononLoadError.shapeDisagreement(path, conv.weight.shape, [five.outFeatures, 1, five.inFeatures])
+                }
+                replacements.append((path, PhononPointwiseConv1d(packed: five, execution: execution)))
+            case let linear as Linear:
+                guard linear.weight.shape == [five.outFeatures, five.inFeatures] else {
+                    throw PhononLoadError.shapeDisagreement(path, linear.weight.shape, [five.outFeatures, five.inFeatures])
+                }
+                replacements.append((path, PhononLinear(packed: five, bias: linear.bias, execution: execution)))
+            default:
+                throw PhononLoadError.unsupportedModule(path, String(describing: type(of: module)))
+            }
+        }
+        arrays.removeAll()
+        model.update(modules: ModuleChildren.unflattened(replacements))
+
+        model.computeDType = computeDType
+
+        let casted = Dictionary(
+            uniqueKeysWithValues: model.parameters().flattened().map { key, value -> (String, MLXArray) in
+                guard value.dtype.isFloatingPoint, value.dtype != computeDType else {
+                    return (key, value)
+                }
+                return (key, value.asType(computeDType))
+            }
+        )
+        try model.update(parameters: ModuleParameters.unflattened(casted), verify: .noUnusedKeys)
+
+        model.train(false)
+        eval(model)
+        return model
+    }
+}
+
+/// Why a Phonon-2 packed directory could not be loaded.
+///
+/// Every case names the thing that disagreed. A packed file that half-loads is
+/// the failure mode this port has already been bitten by once: the previous
+/// attempt passed every shape check and transcribed nonsense, so nothing here
+/// falls back to a default or loads on regardless.
+public enum PhononLoadError: Error, CustomStringConvertible {
+    case notPacked(String)
+    case incompleteBlock(String, kind: String)
+    case unmappableTensor(String)
+    case unexpectedPackedTensor(String)
+    case duplicateTensor(String)
+    case coverage(unexplained: [String], unused: [String])
+    case noSuchModule(String)
+    case shapeDisagreement(String, [Int], [Int])
+    case unsupportedModule(String, String)
+
+    public var description: String {
+        switch self {
+        case .notPacked(let path):
+            "\(path) has no phonon_packed / phonon_int6 metadata; it is not a converted Phonon-2 file"
+        case .incompleteBlock(let name, let kind):
+            "\(kind) block \(name) is missing one of its arrays"
+        case .unmappableTensor(let tensor):
+            "the checkpoint tensor \(tensor) has no counterpart in this model"
+        case .unexpectedPackedTensor(let tensor):
+            "the five-value tensor \(tensor) does not name a .weight; a module, not a table, was expected"
+        case .duplicateTensor(let key):
+            "two packed blocks both claim to supply \(key)"
+        case .coverage(let unexplained, let unused):
+            "packed metadata does not account for the model: "
+                + "\(unexplained.count) parameter(s) supplied by nothing"
+                + (unexplained.isEmpty ? "" : " (first: \(unexplained[0]))")
+                + ", \(unused.count) packed block(s) supplying nothing"
+                + (unused.isEmpty ? "" : " (first: \(unused[0]))")
+        case .noSuchModule(let path):
+            "the packed file names \(path), which this model has no module for"
+        case .shapeDisagreement(let path, let found, let expected):
+            "\(path) is \(found) but its packed block is \(expected)"
+        case .unsupportedModule(let path, let type):
+            "\(path) is a \(type); only Linear and pointwise Conv1d can be backed by packed weights"
+        }
+    }
 }
 
 private extension ParakeetModel {
+    /// Reads `config.json` and normalises the non-standard float tokens some
+    /// exported NeMo configs carry.
+    static func readConfig(_ modelDir: URL) throws -> Data {
+        let configURL = modelDir.appendingPathComponent("config.json")
+        return normalizedConfigData(try Data(contentsOf: configURL))
+    }
+
+    /// Builds the module tree a config describes, with its initialiser weights
+    /// still in place.
+    ///
+    /// Shared by the fp16 loader and the Phonon-2 packed loader so the two
+    /// cannot drift into describing different models: a packed file whose
+    /// config says `tdt` has to produce the same tree as an unpacked one, or the
+    /// speed gate would be comparing two different networks.
+    static func makeModel(_ rawConfig: ParakeetRawConfig) throws -> ParakeetModel {
+        let variant = try ParakeetVariantResolver.resolve(rawConfig)
+        switch variant {
+        case .tdt:
+            let cfg = try ParakeetConfigParser.parseTDT(rawConfig)
+            return ParakeetModel(
+                variant: .tdt,
+                preprocessConfig: cfg.preprocessor,
+                encoderConfig: cfg.encoder,
+                vocabulary: cfg.joint.vocabulary,
+                durations: cfg.decoding.durations,
+                maxSymbols: cfg.decoding.greedy?.maxSymbols,
+                decoderConfig: cfg.decoder,
+                jointConfig: cfg.joint,
+                ctcConfig: nil
+            )
+        case .tdtCtc:
+            let cfg = try ParakeetConfigParser.parseTDTCTC(rawConfig)
+            return ParakeetModel(
+                variant: .tdtCtc,
+                preprocessConfig: cfg.preprocessor,
+                encoderConfig: cfg.encoder,
+                vocabulary: cfg.joint.vocabulary,
+                durations: cfg.decoding.durations,
+                maxSymbols: cfg.decoding.greedy?.maxSymbols,
+                decoderConfig: cfg.decoder,
+                jointConfig: cfg.joint,
+                ctcConfig: cfg.auxCTC.decoder
+            )
+        case .rnnt:
+            let cfg = try ParakeetConfigParser.parseRNNT(rawConfig)
+            return ParakeetModel(
+                variant: .rnnt,
+                preprocessConfig: cfg.preprocessor,
+                encoderConfig: cfg.encoder,
+                vocabulary: cfg.joint.vocabulary,
+                durations: [1],
+                maxSymbols: cfg.decoding.greedy?.maxSymbols,
+                decoderConfig: cfg.decoder,
+                jointConfig: cfg.joint,
+                ctcConfig: nil
+            )
+        case .ctc:
+            let cfg = try ParakeetConfigParser.parseCTC(rawConfig)
+            return ParakeetModel(
+                variant: .ctc,
+                preprocessConfig: cfg.preprocessor,
+                encoderConfig: cfg.encoder,
+                vocabulary: cfg.decoder.vocabulary,
+                durations: [1],
+                maxSymbols: nil,
+                decoderConfig: nil,
+                jointConfig: nil,
+                ctcConfig: cfg.decoder
+            )
+        }
+    }
+
     static func sanitize(weights: [String: MLXArray], variant: Variant) -> [String: MLXArray] {
         var sanitized: [String: MLXArray] = [:]
         sanitized.reserveCapacity(weights.count)
