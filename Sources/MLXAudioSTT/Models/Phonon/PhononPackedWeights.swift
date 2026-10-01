@@ -102,10 +102,55 @@ public struct PhononFiveValue: @unchecked Sendable {
                                inFeatures: inFeatures, tile: tile)
     }
 
-    /// Straightforward decode, used by the parity gate and as the fallback when
-    /// the kernel is disabled. Deliberately simple rather than fast: its job is
-    /// to be obviously correct so the kernel has something trustworthy to be
-    /// checked against.
+    /// A byte of five trits, unpacked once instead of per weight.
+    ///
+    /// `tritSigns[b * 5 + k]` is `(b / 3^k) % 3 - 1` — the sign of the k-th
+    /// weight packed in byte `b`, the same arithmetic the per-weight division
+    /// loop used to do. 256 entries rather than 243 so that a byte above the
+    /// valid base-3 range decodes to exactly what the division produced, which
+    /// keeps a corrupt file decoding the way it always did rather than trapping
+    /// on a table it does not fit.
+    private static let tritSigns: [Int8] = {
+        var table = [Int8](repeating: 0, count: 256 * 5)
+        for b in 0..<256 {
+            var code = b
+            for k in 0..<5 {
+                table[b * 5 + k] = Int8(code % 3) - 1
+                code /= 3
+            }
+        }
+        return table
+    }()
+
+    /// Expands the block to a dense float16 matrix. This is what loading a
+    /// Phonon-2 model spends its time in, and it is the reference the parity
+    /// gate and the kernel are both checked against.
+    ///
+    /// Two things make it fast without making it clever:
+    ///
+    /// - **Rows are decoded in parallel.** The hi/lo bit of a weight is found by
+    ///   counting the non-zeros before it, which reads like a serial scan over
+    ///   the whole matrix — but `nzRow[o]` is that count for the start of row
+    ///   `o`, already absolute, so each row carries its own entry point and no
+    ///   row needs to know what any other row decoded. (`nzTile` would cut the
+    ///   same seam finer, inside a row; with 1024 to 4096 rows per block there
+    ///   is nothing to gain by it, so it stays unread here.)
+    /// - **A byte of trits is unpacked once**, through `tritSigns`, rather than
+    ///   re-divided by 3 up to four times for each of the five weights in it.
+    ///
+    /// Two further changes look obvious, were tried, and are deliberately not
+    /// here. Writing float16 straight into the buffer rounds nothing — every
+    /// value is `±lo` or `±hi`, which are float16 already — but measured 0.89 s
+    /// against 0.69 s on otherwise identical code. Allocating the staging buffer
+    /// with `UnsafeMutablePointer.allocate` rather than this `[Float]` cost 8 MB
+    /// of peak footprint (1.511 GiB against 1.503) and was not faster either. Neither is an obstacle to a later attempt;
+    /// both need a measurement rather than a glance.
+    ///
+    /// Bounded by `I`, never by `rb * 5`. The unused digits in a row's last byte
+    /// are written as 0, which decodes as -1 rather than 0 — Fermion's own
+    /// encoding, kept as-is so the container stays byte-identical to theirs.
+    /// Reading past column `I` would therefore produce spurious -1 weights that
+    /// look like plausible data.
     public func dequantized() -> MLXArray {
         let O = outFeatures, I = inFeatures
         let tritBytes = trits.asArray(UInt8.self)
@@ -116,22 +161,48 @@ public struct PhononFiveValue: @unchecked Sendable {
         let rb = (I + 4) / 5
 
         var w = [Float](repeating: 0, count: O * I)
-        for o in 0..<O {
-            var seen = Int(rowBase[o])
-            // Bounded by I, never by rb * 5. The unused digits in a row's last
-            // byte are written as 0, which decodes as -1 rather than 0 —
-            // Fermion's own encoding, kept as-is so the container stays
-            // byte-identical to theirs. Reading past column I would therefore
-            // produce spurious -1 weights that look like plausible data.
-            for i in 0..<I {
-                let byte = Int(tritBytes[o * rb + i / 5])
-                var code = byte
-                for _ in 0..<(i % 5) { code /= 3 }
-                let sign = Int(code % 3) - 1        // {-1, 0, +1}
-                if sign == 0 { continue }
-                let bit = (Int(bitBytes[seen >> 3]) >> (seen & 7)) & 1
-                seen += 1
-                w[o * I + i] = Float(sign) * (bit == 1 ? hiV[o] : loV[o])
+        w.withUnsafeMutableBufferPointer { wb in
+            tritBytes.withUnsafeBufferPointer { tritBuf in
+                bitBytes.withUnsafeBufferPointer { bitBuf in
+                    Self.tritSigns.withUnsafeBufferPointer { signBuf in
+                        // Base addresses rather than the buffers themselves:
+                        // `UnsafePointer` is Sendable and `UnsafeBufferPointer`
+                        // is not, and these are read-only here or written only
+                        // within one chunk's own rows.
+                        let out = wb.baseAddress!
+                        let tb = tritBuf.baseAddress!
+                        let bb = bitBuf.baseAddress!
+                        let signs = signBuf.baseAddress!
+                        // One chunk per 64 rows: enough chunks that every
+                        // thread gets work on the smallest blocks here
+                        // (O = 1024), large enough that the dispatch is noise
+                        // against the rows it hands over.
+                        let rowsPerChunk = 64
+                        let chunks = (O + rowsPerChunk - 1) / rowsPerChunk
+                        DispatchQueue.concurrentPerform(iterations: chunks) { chunk in
+                            let rowEnd = min(O, (chunk + 1) * rowsPerChunk)
+                            for o in (chunk * rowsPerChunk)..<rowEnd {
+                                var seen = Int(rowBase[o])
+                                let loRow = loV[o], hiRow = hiV[o]
+                                let rowOut = out + o * I
+                                var byteIndex = o * rb
+                                var i = 0
+                                while i < I {
+                                    let base = Int(tb[byteIndex]) * 5
+                                    for k in 0..<min(5, I - i) {
+                                        let sign = signs[base + k]
+                                        if sign == 0 { continue }
+                                        let bit = (Int(bb[seen >> 3]) >> (seen & 7)) & 1
+                                        seen += 1
+                                        rowOut[i + k] = Float(sign) * (bit == 1 ? hiRow : loRow)
+                                    }
+                                    byteIndex += 1
+                                    i += 5
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         return MLXArray(w, [O, I]).asType(.float16)
