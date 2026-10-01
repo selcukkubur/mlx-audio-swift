@@ -66,6 +66,19 @@ public struct NemotronSpeakerSegment: Sendable {
     /// span's end time reflects the fully flushed stream rather than a
     /// provisional boundary that a later chunk could still extend.
     public let isFinal: Bool
+
+    /// Spelled out rather than left to the compiler: the memberwise
+    /// initializer Swift synthesises for a `public struct` is `internal`, so
+    /// without this a caller outside this module can read a segment `feed`
+    /// returned but cannot construct one — which is what a consumer's unit
+    /// test needs in order to exercise its own span mapping without running
+    /// the model.
+    public init(speakerIndex: Int, start: Double, end: Double, isFinal: Bool) {
+        self.speakerIndex = speakerIndex
+        self.start = start
+        self.end = end
+        self.isFinal = isFinal
+    }
 }
 
 /// Nemotron 3 Diarization: the 31-layer rotary FastConformer-replacement
