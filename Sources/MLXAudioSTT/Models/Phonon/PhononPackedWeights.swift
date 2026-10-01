@@ -163,42 +163,53 @@ public struct PhononFiveValue: @unchecked Sendable {
         var w = [Float](repeating: 0, count: O * I)
         w.withUnsafeMutableBufferPointer { wb in
             tritBytes.withUnsafeBufferPointer { tritBuf in
-                bitBytes.withUnsafeBufferPointer { bitBuf in
-                    Self.tritSigns.withUnsafeBufferPointer { signBuf in
-                        // Base addresses rather than the buffers themselves:
-                        // `UnsafePointer` is Sendable and `UnsafeBufferPointer`
-                        // is not, and these are read-only here or written only
-                        // within one chunk's own rows.
-                        let out = wb.baseAddress!
-                        let tb = tritBuf.baseAddress!
-                        let bb = bitBuf.baseAddress!
-                        let signs = signBuf.baseAddress!
-                        // One chunk per 64 rows: enough chunks that every
-                        // thread gets work on the smallest blocks here
-                        // (O = 1024), large enough that the dispatch is noise
-                        // against the rows it hands over.
-                        let rowsPerChunk = 64
-                        let chunks = (O + rowsPerChunk - 1) / rowsPerChunk
-                        DispatchQueue.concurrentPerform(iterations: chunks) { chunk in
-                            let rowEnd = min(O, (chunk + 1) * rowsPerChunk)
-                            for o in (chunk * rowsPerChunk)..<rowEnd {
-                                var seen = Int(rowBase[o])
-                                let loRow = loV[o], hiRow = hiV[o]
-                                let rowOut = out + o * I
-                                var byteIndex = o * rb
-                                var i = 0
-                                while i < I {
-                                    let base = Int(tb[byteIndex]) * 5
-                                    for k in 0..<min(5, I - i) {
-                                        let sign = signs[base + k]
-                                        if sign == 0 { continue }
-                                        let bit = (Int(bb[seen >> 3]) >> (seen & 7)) & 1
-                                        seen += 1
-                                        rowOut[i + k] = Float(sign) * (bit == 1 ? hiRow : loRow)
-                                    }
-                                    byteIndex += 1
-                                    i += 5
+                Self.tritSigns.withUnsafeBufferPointer { signBuf in
+                    // Base addresses rather than the buffers themselves:
+                    // `UnsafePointer` is Sendable and `UnsafeBufferPointer` is
+                    // not. Every index into these three is bounded by something
+                    // already checked — `trits` is `[O, rb]` by `load`, the sign
+                    // table is indexed by a byte, the output by `o * I + i` —
+                    // which is exactly why they can be read unchecked and
+                    // `hiBits` below cannot.
+                    let out = wb.baseAddress!
+                    let tb = tritBuf.baseAddress!
+                    let signs = signBuf.baseAddress!
+                    // One chunk per 64 rows: enough chunks that every thread
+                    // gets work on the smallest blocks here (O = 1024), large
+                    // enough that the dispatch is noise against the rows it
+                    // hands over.
+                    let rowsPerChunk = 64
+                    let chunks = (O + rowsPerChunk - 1) / rowsPerChunk
+                    DispatchQueue.concurrentPerform(iterations: chunks) { chunk in
+                        let rowEnd = min(O, (chunk + 1) * rowsPerChunk)
+                        for o in (chunk * rowsPerChunk)..<rowEnd {
+                            var seen = Int(rowBase[o])
+                            let loRow = loV[o], hiRow = hiV[o]
+                            let rowOut = out + o * I
+                            var byteIndex = o * rb
+                            var i = 0
+                            while i < I {
+                                let base = Int(tb[byteIndex]) * 5
+                                for k in 0..<min(5, I - i) {
+                                    let sign = signs[base + k]
+                                    if sign == 0 { continue }
+                                    // `bitBytes` here, not a raw pointer, and
+                                    // deliberately. `seen` starts at `nzRow[o]`
+                                    // and advances once per non-zero, both of
+                                    // which come from the file, and `hi_bits` is
+                                    // the one packed array whose length nothing
+                                    // can check at load: its length is the
+                                    // non-zero count, and that is only known by
+                                    // doing this decode. Swift's bounds check is
+                                    // what stands between a malformed download
+                                    // and an out-of-bounds read, and it measured
+                                    // free behind the dependent load.
+                                    let bit = (Int(bitBytes[seen >> 3]) >> (seen & 7)) & 1
+                                    seen += 1
+                                    rowOut[i + k] = Float(sign) * (bit == 1 ? hiRow : loRow)
                                 }
+                                byteIndex += 1
+                                i += 5
                             }
                         }
                     }
